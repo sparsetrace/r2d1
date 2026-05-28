@@ -67,12 +67,13 @@ class EpochLoop:
     checkpoint_every: save checkpoint every N epochs (default: 1)
     log_every       : log to D1 every N epochs (default: 1)
     start_epoch     : skip epochs before this (used when resuming)
+    async_checkpoint: upload checkpoint in background while GPU keeps training (default: True)
     """
 
     def __init__(self, iterable, job,
                  model=None, optimizer=None,
                  checkpoint_every=1, log_every=1,
-                 start_epoch=0):
+                 start_epoch=0, async_checkpoint=True):
         self._iter             = iterable
         self._job              = job
         self._model            = model
@@ -80,6 +81,7 @@ class EpochLoop:
         self._checkpoint_every = checkpoint_every
         self._log_every        = log_every
         self._start_epoch      = start_epoch
+        self._async            = async_checkpoint
         self._epoch_start_time = None
 
     def __iter__(self):
@@ -105,15 +107,25 @@ class EpochLoop:
 
             # Checkpoint to R2
             if self._model is not None and i % self._checkpoint_every == 0:
-                self._job.save_checkpoint(
-                    i, self._model, self._optimizer, ctx.loss
-                )
+                if self._async:
+                    # Serialize NOW (copies weights off GPU), upload in background
+                    # GPU is free to start next epoch immediately after serialize
+                    self._job.save_checkpoint_async(
+                        i, self._model, self._optimizer, ctx.loss
+                    )
+                else:
+                    self._job.save_checkpoint(
+                        i, self._model, self._optimizer, ctx.loss
+                    )
 
             # Print progress
             loss_str = f"  loss={ctx.loss:.4f}" if ctx.loss is not None else ""
             acc_str  = f"  acc={ctx.accuracy:.4f}" if ctx.accuracy is not None else ""
             print(f"[r2d1] epoch {i}/{max(self._iter)}"
                   f"  {duration:.1f}s{loss_str}{acc_str}")
+
+        # Always flush the last checkpoint before loop exits
+        self._job.wait_for_checkpoint()
 
 
 def job_decorator(tracker, name, dataset_key=None, dataset_size_mb=None,
