@@ -6,6 +6,7 @@ Works anywhere: local machine, Colab, vast.ai, any GPU server.
 No knowledge of how jobs are scheduled or restarted.
 """
 import time
+import threading
 import requests
 import boto3
 from botocore.config import Config
@@ -26,6 +27,7 @@ class Job:
     def __init__(self, job_id, tracker):
         self.job_id = job_id
         self._t = tracker
+        self._pending_checkpoint = None   # background thread for async upload
 
     # ------------------------------------------------------------------
     # Metrics
@@ -46,20 +48,60 @@ class Job:
 
     def save_checkpoint(self, epoch, model_or_params, optimizer_state=None, loss=None):
         """
-        Serialize and upload checkpoint to R2.
-        Auto-detects PyTorch nn.Module or JAX param pytree.
-        Returns the R2 key.
+        Serialize and upload checkpoint to R2 (synchronous).
+        Blocks until upload is complete.
         """
         key  = f"checkpoints/job_{self.job_id}/epoch_{epoch}.pkl"
         data = serialize(epoch, model_or_params, optimizer_state, loss)
+        self._upload(key, data, epoch)
+        return key
 
+    def save_checkpoint_async(self, epoch, model_or_params, optimizer_state=None, loss=None):
+        """
+        Async checkpoint — serializes on CPU immediately (copying weights off GPU),
+        then uploads to R2 in a background thread while your GPU keeps training.
+
+        The previous async upload (if any) is waited on first, so you never
+        have two uploads in flight at once and you never skip a checkpoint.
+
+        Usage:
+            for epoch in EpochLoop(...):
+                loss = train_step(...)       # GPU working
+                epoch.loss = float(loss)
+                # snapshot weights to CPU now, upload happens in background:
+                job.save_checkpoint_async(epoch.epoch, model, optimizer, loss)
+            job.wait_for_checkpoint()        # flush before exit
+        """
+        # Wait for previous upload to finish before starting the next one
+        self.wait_for_checkpoint()
+
+        key = f"checkpoints/job_{self.job_id}/epoch_{epoch}.pkl"
+
+        # Serialize NOW (copies weights to CPU/RAM synchronously)
+        # This is the important part — GPU is free to continue after this
+        data = serialize(epoch, model_or_params, optimizer_state, loss)
+
+        def _upload_and_log():
+            self._upload(key, data, epoch)
+
+        self._pending_checkpoint = threading.Thread(target=_upload_and_log, daemon=True)
+        self._pending_checkpoint.start()
+        return key
+
+    def wait_for_checkpoint(self):
+        """Block until any in-flight async checkpoint upload finishes."""
+        if self._pending_checkpoint is not None:
+            self._pending_checkpoint.join()
+            self._pending_checkpoint = None
+
+    def _upload(self, key, data, epoch):
+        """Internal: upload bytes to R2 and update D1."""
         self._t._s3.put_object(Bucket=self._t.bucket, Key=key, Body=data)
         self._t._d1(
             "UPDATE jobs SET last_checkpoint=?, updated_at=? WHERE id=?",
             [key, _now(), self.job_id]
         )
         print(f"[r2d1] ✓ checkpoint  job={self.job_id}  epoch={epoch}")
-        return key
 
     def load_latest_checkpoint(self, model_or_params=None, optimizer_state=None):
         """
