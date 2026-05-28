@@ -239,3 +239,26 @@ class Tracker:
     def get_job(self, job_id):
         """Return a Job handle for an existing job (no checkpoint loaded)."""
         return Job(job_id, self)
+
+    def job(self, name, dataset_key=None, dataset_size_mb=None,
+            resume_job_id=None, model_or_params=None, optimizer_state=None):
+        """
+        Decorator — wraps a training function with full job lifecycle.
+        Injects a Job as the first argument. Handles start/interrupt/complete.
+
+        @tracker.job(name="dit_run1", dataset_key="datasets/imagenet.tar")
+        def train(job):
+            for epoch in EpochLoop(range(100), job=job, model=model, optimizer=opt):
+                loss = train_step(...)
+                epoch.loss = float(loss)
+
+        train()
+        """
+        from .loop import job_decorator
+        return job_decorator(
+            self, name=name, dataset_key=dataset_key,
+            dataset_size_mb=dataset_size_mb,
+            resume_job_id=resume_job_id,
+            model_or_params=model_or_params,
+            optimizer_state=optimizer_state,
+        )
