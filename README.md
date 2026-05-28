@@ -2,13 +2,31 @@
 
 Lightweight ML experiment tracker using Cloudflare **R2** (checkpoints) + **D1** (metrics & metadata).
 
-- Works with **PyTorch and JAX**, single or multi-GPU
+- **Agnostic** — ships whatever files your model produces. Zero opinion on format.
+- Works with **PyTorch, JAX, or anything else**
 - Runs anywhere — local, Colab, vast.ai, any GPU server
-- No opinions about how jobs are scheduled or restarted
+- Async checkpoint uploads — GPU keeps training while files ship to R2
 
 ```bash
 pip install r2d1
 ```
+
+---
+
+## How it works
+
+```
+Your model                        r2d1
+----------                        ----
+model.safetensors  ──────────→   ships to R2
+config.json        ──────────→   jobs/job_3/epoch_42/
+run.log            ──────────→
+
+loss, accuracy, duration  ──→   logs to D1  (live feed for you, Alice, team)
+```
+
+D1 always gets: `epoch`, `loss`, `accuracy`, `duration_sec`, `timestamp`.  
+R2 gets: whatever files you put in `epoch.files`. r2d1 never opens them.
 
 ---
 
@@ -19,123 +37,110 @@ from r2d1 import Tracker, EpochLoop
 
 tracker = Tracker(
     account_id     = "your_cloudflare_account_id",
-    api_token      = "your_cloudflare_api_token",
+    api_token      = "your_cloudflare_api_token",   # Token value from R2 API token
     d1_database_id = "your_d1_database_id",
     r2_bucket      = "your_bucket_name",
     r2_access_key  = "your_r2_access_key",
     r2_secret_key  = "your_r2_secret_key",
 )
+# D1 tables created automatically on first run
 ```
 
 ---
 
 ## Usage
 
-### tqdm-style loop (recommended)
+### tqdm-style loop
 
 ```python
-job = tracker.start_job("dit_run1", dataset_key="datasets/imagenet256.tar")
+job = tracker.start_job("dit_run1", dataset_key="hf://datasets/imagenet-1k")
 
 try:
-    for epoch in EpochLoop(range(num_epochs), job=job, model=model, optimizer=opt):
-        # your JIT'd / multi-GPU training code — completely untouched
-        loss, grads = train_step(params, batch)
-        params = update(params, grads)
+    for epoch in EpochLoop(range(400), job=job):
 
-        # set metrics on the epoch context object
-        epoch.loss     = float(loss)
-        epoch.accuracy = float(acc)
-        # ↑ D1 log + R2 checkpoint happen automatically at end of each iteration
+        loss = train_step(...)      # your JIT'd / multi-GPU code — untouched
+
+        epoch.loss  = float(loss)
+        epoch.files = {             # your model packages its own checkpoint
+            "model.safetensors": model.to_safetensors_bytes(),
+            "config.json":       model.to_config_bytes(),
+            "run.log":           logger.flush_bytes(),
+        }
+        # ↑ files upload async to R2, loss logs to D1 — both happen automatically
 
     job.complete()
 
-except Exception as e:
-    job.interrupt()   # Alice (or you) can restart from last checkpoint
+except Exception:
+    job.interrupt()   # D1 status → 'interrupted', Alice can restart
     raise
 ```
 
 ### Resume after interruption
 
 ```python
-job, start_epoch, last_loss, params, opt = tracker.resume_job(
-    job_id=3, model_or_params=model, optimizer_state=opt
-)
+job = tracker.resume_job(job_id=3)
 
-for epoch in EpochLoop(range(num_epochs), job=job, model=params,
-                       optimizer=opt, start_epoch=start_epoch + 1):
+files = job.load_latest()   # downloads all files from last checkpoint
+# files["model.safetensors"], files["config.json"], etc.
+
+model  = MyModel.from_safetensors_bytes(files["model.safetensors"],
+                                        files["config.json"])
+logger = Logger.from_bytes(files["run.log"])
+
+for epoch in EpochLoop(range(400), job=job, start_epoch=last_epoch + 1):
     ...
 ```
 
-### Decorator-style (handles lifecycle automatically)
+### Decorator style
 
 ```python
-@tracker.job(name="dit_run1", dataset_key="datasets/imagenet256.tar")
+@tracker.job(name="dit_run1", dataset_key="hf://datasets/imagenet-1k")
 def train(job):
-    for epoch in EpochLoop(range(num_epochs), job=job, model=model, optimizer=opt):
-        loss, grads = train_step(params, batch)
-        epoch.loss = float(loss)
+    for epoch in EpochLoop(range(400), job=job):
+        loss = train_step(...)
+        epoch.loss  = float(loss)
+        epoch.files = model.checkpoint()
 
-train()   # start/interrupt/complete handled for you
-```
-
-### Resume with decorator
-
-```python
-@tracker.job(name="dit_run1", resume_job_id=3,
-             model_or_params=model, optimizer_state=opt)
-def train(job, start_epoch=0, params=None, opt_state=None):
-    for epoch in EpochLoop(range(num_epochs), job=job,
-                           model=params, optimizer=opt_state,
-                           start_epoch=start_epoch):
-        ...
-
-train()
-```
-
-### JAX — identical, pass pytrees instead of nn.Module
-
-```python
-for epoch in EpochLoop(range(num_epochs), job=job, model=params, optimizer=opt_state):
-    params, opt_state, loss = train_step(params, opt_state, batch)
-    epoch.loss = float(loss)
+train()   # start/interrupt/complete handled automatically
 ```
 
 ### EpochLoop options
 
 ```python
 EpochLoop(
-    range(num_epochs),
+    range(400),
     job              = job,
-    model            = model,        # nn.Module or JAX pytree
-    optimizer        = opt,          # optional
-    checkpoint_every = 5,            # checkpoint every 5 epochs (default: 1)
-    log_every        = 1,            # log to D1 every epoch (default: 1)
-    start_epoch      = 10,           # skip first 10 epochs (used when resuming)
+    checkpoint_every = 10,    # ship files every 10 epochs (default: 1)
+    log_every        = 1,     # log to D1 every epoch (default: 1)
+    start_epoch      = 50,    # skip first 50 epochs — for resuming
+    async_checkpoint = True,  # upload in background (default: True)
 )
 ```
 
 ---
 
-## Dataset location
+## R2 layout
 
-`dataset_key` is just a string — use whatever convention makes sense:
-
-```python
-tracker.start_job("run1", dataset_key="s3://my-bucket/imagenet.tar")
-tracker.start_job("run1", dataset_key="hf://datasets/imagenet-1k")
-tracker.start_job("run1", dataset_key="r2://my-bucket/imagenet256.tar")
 ```
-
-`r2d1` stores it as metadata in D1. How you actually load the dataset is up to your training script.
+r2://your-bucket/
+└── jobs/
+    └── job_3/
+        ├── epoch_0/
+        │   ├── model.safetensors
+        │   ├── config.json
+        │   └── run.log
+        ├── epoch_10/
+        │   └── ...
+        └── epoch_42/
+            └── ...
+```
 
 ---
 
-## Check progress
+## D1 schema (auto-created)
 
-```python
-tracker.list_jobs()   # all jobs + status
-job.status()          # this job's per-epoch metrics
-```
+**jobs** — `id`, `name`, `dataset_key`, `status`, `last_checkpoint_prefix`, `submitted_at`, `updated_at`  
+**epochs** — `job_id`, `epoch`, `loss`, `accuracy`, `duration_sec`, `logged_at`
 
 ---
 
@@ -144,10 +149,9 @@ job.status()          # this job's per-epoch metrics
 ```
 r2d1/
 ├── r2d1/
-│   ├── __init__.py     # exports Tracker, Job, EpochLoop
-│   ├── tracker.py      # Tracker + Job
-│   ├── loop.py         # EpochLoop + job_decorator
-│   └── checkpoint.py   # serialize/deserialize (torch + JAX → numpy)
+│   ├── __init__.py   # exports Tracker, Job, EpochLoop
+│   ├── tracker.py    # Tracker + Job — R2 upload, D1 logging
+│   └── loop.py       # EpochLoop + @tracker.job decorator
 ├── setup.py
 └── README.md
 ```
