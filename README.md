@@ -1,127 +1,91 @@
-# R2D1
+# r2d1
 
-Lightweight ML experiment tracker using Cloudflare **R2** (checkpoints) + **D1** (metrics & metadata).  
-Works with **PyTorch and JAX**. Designed to survive interruptions.
+Lightweight ML experiment tracker using Cloudflare **R2** (checkpoints) + **D1** (metrics & metadata).
 
-```
+- Works with **PyTorch and JAX**
+- Runs anywhere — local, Colab, vast.ai, any GPU server
+- No opinions about how your jobs are scheduled or restarted
+
+```bash
 pip install r2d1
 ```
 
 ---
 
-## Architecture
+## Setup
 
-```
-You
- └── submit job (D1)
-      │
-      ▼
-Alice (Modal — persistent, always on)
- └── polls D1 every 5 min
- └── finds interrupted/pending jobs
- └── spins up Bob on vast.ai
- └── passes job info (R2 checkpoint + D1 metadata)
-      │
-      ▼
-Bob (vast.ai GPU — cheap, disposable)
- └── installs r2d1
- └── downloads training script from R2
- └── resumes from last checkpoint
- └── logs epochs to D1, checkpoints to R2
- └── if interrupted → Alice restarts him
+```python
+from r2d1 import Tracker
+
+tracker = Tracker(
+    account_id     = "your_cloudflare_account_id",
+    api_token      = "your_cloudflare_api_token",
+    d1_database_id = "your_d1_database_id",
+    r2_bucket      = "your_bucket_name",
+    r2_access_key  = "your_r2_access_key",
+    r2_secret_key  = "your_r2_secret_key",
+)
+# D1 tables are created automatically on first run
 ```
 
 ---
 
-## Bob — training script (torch or JAX)
+## Usage
+
+### New job
 
 ```python
-import os
-from r2d1 import Tracker
+job = tracker.start_job("dit_run1", dataset_key="datasets/imagenet256.tar")
 
-tracker = Tracker(
-    account_id     = os.environ["CLOUDFLARE_ACCOUNT_ID"],
-    api_token      = os.environ["CLOUDFLARE_API_TOKEN"],
-    d1_database_id = os.environ["CLOUDFLARE_D1_DATABASE_ID"],
-    r2_bucket      = os.environ["CLOUDFLARE_R2_BUCKET"],
-    r2_access_key  = os.environ["CLOUDFLARE_R2_ACCESS_KEY"],
-    r2_secret_key  = os.environ["CLOUDFLARE_R2_SECRET_KEY"],
-)
-
-job_id = int(os.environ.get("R2D1_JOB_ID", 0))
-
-# --- New job ---
-if job_id == 0:
-    job = tracker.start_job(
-        name          = "dit_run1",
-        dataset_key   = "datasets/imagenet256.tar",
-        vast_image    = "pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime",
-        vast_gpu_type = "RTX_4090",
-        script_key    = "scripts/train_dit.py",   # R2 path to this script
-    )
-    start_epoch = 0
-
-# --- Resume interrupted job ---
-else:
-    job, start_epoch, last_loss, model, optimizer = tracker.resume_job(
-        job_id, model, optimizer
-    )
-    start_epoch += 1
-
-# --- Training loop ---
 try:
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(num_epochs):
         t0 = time.time()
-        loss, acc = train_one_epoch(model, dataloader, optimizer)
-        duration  = time.time() - t0
 
-        job.save_checkpoint(epoch, model, optimizer, loss)
-        job.log(epoch=epoch, loss=loss, accuracy=acc, duration_sec=duration)
+        loss, acc = train_one_epoch(...)   # your training code
+
+        job.save_checkpoint(epoch, model, optimizer, loss)   # → R2
+        job.log(epoch=epoch, loss=loss, accuracy=acc,        # → D1
+                duration_sec=time.time() - t0)
 
     job.complete()
 
 except Exception as e:
-    job.interrupt()   # Alice will restart Bob
-    raise e
+    job.interrupt()   # marks status='interrupted' in D1
+    raise
 ```
 
-### JAX — same API, different objects
+### Resume after interruption
 
 ```python
-# Pass params pytree instead of nn.Module
+job, start_epoch, last_loss, model, optimizer = tracker.resume_job(
+    job_id=3, model_or_params=model, optimizer_state=optimizer
+)
+
+for epoch in range(start_epoch + 1, num_epochs):
+    ...
+```
+
+### JAX — identical API, pass pytrees instead of nn.Module
+
+```python
 job.save_checkpoint(epoch, params, opt_state, loss)
 
-job, start_epoch, loss, params, opt_state = tracker.resume_job(job_id)
+job, start_epoch, loss, params, opt_state = tracker.resume_job(job_id=3)
 ```
 
----
-
-## Alice — deploy once, runs forever
-
-```bash
-pip install r2d1[alice]
-modal deploy alice.py
-```
-
-Set these in Modal dashboard → Secrets → `r2d1-secrets`:
-```
-CLOUDFLARE_ACCOUNT_ID
-CLOUDFLARE_API_TOKEN
-CLOUDFLARE_D1_DATABASE_ID
-CLOUDFLARE_R2_BUCKET
-CLOUDFLARE_R2_ACCESS_KEY
-CLOUDFLARE_R2_SECRET_KEY
-VASTAI_API_KEY
-```
-
----
-
-## Check progress (from anywhere)
+### Check progress
 
 ```python
-tracker.list_jobs()        # all jobs + status
-job.status()               # this job's metrics per epoch
+tracker.list_jobs()   # all jobs + status
+job.status()          # this job's epochs + metrics
 ```
+
+---
+
+## D1 schema (auto-created)
+
+**jobs** — one row per run: name, dataset_key, status, last_checkpoint, timestamps  
+**epochs** — one row per epoch: loss, accuracy, duration_sec
 
 ---
 
@@ -130,15 +94,20 @@ job.status()               # this job's metrics per epoch
 ```
 r2d1/
 ├── r2d1/
-│   ├── __init__.py       # exports Tracker, Job
-│   ├── tracker.py        # Tracker + Job classes
-│   └── checkpoint.py     # serialize/deserialize (torch + JAX, numpy-based)
-├── alice.py              # Modal server — polls D1, spins up vast.ai
+│   ├── __init__.py     # exports Tracker, Job
+│   ├── tracker.py      # Tracker + Job
+│   └── checkpoint.py   # serialize/deserialize (torch + JAX → numpy)
 ├── setup.py
 └── README.md
 ```
 
-## D1 schema (auto-created)
+---
 
-**jobs** — one row per training run, includes vast.ai image + gpu type + script location  
-**epochs** — one row per epoch with loss, accuracy, duration
+## Notes
+
+- Checkpoints are serialized to **numpy** — framework-agnostic, so a JAX
+  checkpoint could in principle be loaded by a torch script and vice versa
+- `job.interrupt()` just sets a status flag in D1 — whatever monitors your
+  jobs (a scheduler, a cron, a person) can query D1 and restart from
+  `last_checkpoint`
+- `r2d1` has no knowledge of vast.ai, Modal, or any scheduler
