@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "r2d1"
+version = "0.1.0"
+description = "Lightweight ML experiment tracker — Cloudflare R2 checkpoints + D1 metrics"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "boto3",
+    "requests",
+    "numpy",
+]
+
+[project.optional-dependencies]
+torch = ["torch"]
+jax   = ["jax", "jaxlib"]
+
+[project.urls]
+Homepage = "https://github.com/sparsetrace/r2d1"
