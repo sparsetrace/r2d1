@@ -6,7 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "r2d1"
 version = "0.1.3"
 description = "Lightweight ML experiment tracker — Cloudflare R2 checkpoints + D1 metrics"
+authors = [{name = "Julio Candanedo", email = "julio@sparsetrace.ai"}]
+keywords = ["R2", "D1", "ML", "cloud", "cloud computing"]
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = [
     "boto3",
