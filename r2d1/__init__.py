@@ -1,37 +1,33 @@
-"""
-r2d1 — tiny ML experiment tracking on Cloudflare R2 + D1.
-
-Public API:
-    from r2d1 import Tracker, r2d1
-
-    job = tracker.start_job("run")
-    for epoch in r2d1(range(100), job=job):
-        epoch.d1(loss=0.1)              # metrics / metadata -> D1
-        epoch.r2({"ckpt.bin": path})   # artifacts / checkpoints -> R2
-"""
-from .tracker import Tracker, Job
-from .loop import r2d1, Epoch
+from .tracker import Tracker, Job, start_job, resume_job, get_job
+from .loop import r2d1, Epoch, EpochLoop
 from .credentials import (
+    MissingSecretError,
     secret,
     require_secret,
     lookup_secret,
     export_secrets,
+    discover_common_secrets,
     r2d1_config,
     load_dotenv,
-    MissingSecretError,
 )
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
+
 __all__ = [
     "Tracker",
     "Job",
+    "start_job",
+    "resume_job",
+    "get_job",
     "r2d1",
     "Epoch",
+    "EpochLoop",
+    "MissingSecretError",
     "secret",
     "require_secret",
     "lookup_secret",
     "export_secrets",
+    "discover_common_secrets",
     "r2d1_config",
     "load_dotenv",
-    "MissingSecretError",
 ]

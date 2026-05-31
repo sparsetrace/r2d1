@@ -1,26 +1,16 @@
-"""Secret discovery helpers for r2d1.
+"""
+r2d1 credential and secret discovery.
 
-The public entry point is :func:`secret`:
+The design goal is notebook/cloud portability without hardcoding secrets in code.
 
-    from r2d1 import secret
-    hf_token = secret("HF_TOKEN", aliases=["HF_HUB_TOKEN"], required=False)
+Search sources:
+  1. .env in current directory or parents, without overriding existing env vars
+  2. os.environ
+  3. Google Colab userdata
+  4. Kaggle UserSecretsClient
 
-It searches common local/cloud/notebook locations, returns the secret as a
-string, and by default copies the discovered value into ``os.environ`` under the
-canonical name.  R2D1 itself uses the same machinery in ``Tracker.from_env()``.
-
-Search model
-------------
-1. Local .env file, loaded with override=False.
-2. os.environ.
-3. Google Colab notebook secrets via google.colab.userdata, if available.
-4. Kaggle notebook secrets via kaggle_secrets.UserSecretsClient, if available.
-
-Most GPU/cloud providers -- Modal, Vast.ai, RunPod, Docker, GitHub Actions,
-SageMaker, Vertex AI Workbench, Lightning AI, Paperspace, JupyterHub, Hugging
-Face Spaces, etc. -- inject secrets as environment variables inside the job.
-Those are intentionally covered by the os.environ step instead of using
-provider-specific SDKs.
+Modal, Vast.ai, RunPod, Docker, CI, SageMaker, Vertex, Lightning AI, etc. are
+covered by os.environ once those platforms inject secrets into the process.
 """
 from __future__ import annotations
 
@@ -35,37 +25,46 @@ class MissingSecretError(RuntimeError):
     """Raised when a required secret cannot be found after all lookups."""
 
 
-# Canonical names and common aliases.  Users can still pass aliases=[...] for
-# project-specific names.  Values intentionally include the canonical name first
-# for clear error messages and stable env export behavior.
-DEFAULT_SECRET_ALIASES: Mapping[str, tuple[str, ...]] = {
+@dataclass(frozen=True)
+class SecretLookup:
+    name: str
+    value: Optional[str]
+    found_as: Optional[str]
+    source: Optional[str]
+    tried_names: tuple[str, ...]
+
+
+# Canonical names and aliases. The canonical name is what gets populated into
+# os.environ when set_env=True. R2D1_* names take precedence over generic names.
+DEFAULT_SECRET_ALIASES: dict[str, tuple[str, ...]] = {
     # Hugging Face
     "HF_TOKEN": (
         "HF_TOKEN",
         "HF_HUB_TOKEN",
         "HUGGINGFACE_TOKEN",
         "HUGGINGFACE_HUB_TOKEN",
-        "HUGGING_FACE_HUB_TOKEN",
     ),
-    # GitHub / git private repos
-    "GITHUB_TOKEN": (
-        "GITHUB_TOKEN",
-        "GH_TOKEN",
-        "GIT_TOKEN",
-    ),
-    # Common experiment/model APIs
+    # GitHub / Git providers
+    "GITHUB_TOKEN": ("GITHUB_TOKEN", "GH_TOKEN"),
+    "GITLAB_TOKEN": ("GITLAB_TOKEN", "GL_TOKEN"),
+    # Experiment/model services
     "WANDB_API_KEY": ("WANDB_API_KEY", "WANDB_KEY"),
+    "COMET_API_KEY": ("COMET_API_KEY",),
+    "NEPTUNE_API_TOKEN": ("NEPTUNE_API_TOKEN",),
+    "MLFLOW_TRACKING_URI": ("MLFLOW_TRACKING_URI",),
+    "MLFLOW_TRACKING_TOKEN": ("MLFLOW_TRACKING_TOKEN",),
+    # LLM/data APIs users often need in notebooks
     "OPENAI_API_KEY": ("OPENAI_API_KEY",),
     "ANTHROPIC_API_KEY": ("ANTHROPIC_API_KEY",),
     "GOOGLE_API_KEY": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+    # Kaggle
     "KAGGLE_USERNAME": ("KAGGLE_USERNAME",),
     "KAGGLE_KEY": ("KAGGLE_KEY", "KAGGLE_API_KEY"),
-    # Modal CLI tokens, if a user wants to resolve them in notebooks.
+    # Provider APIs; these are optional tokens for user workflows, not used by r2d1 itself.
     "MODAL_TOKEN_ID": ("MODAL_TOKEN_ID",),
     "MODAL_TOKEN_SECRET": ("MODAL_TOKEN_SECRET",),
-    # Vast.ai API key names seen in scripts/templates.
-    "VAST_API_KEY": ("VAST_API_KEY", "VASTAI_API_KEY", "VAST_AI_API_KEY"),
-    # Cloudflare / R2D1 bundle
+    "VAST_API_KEY": ("VAST_API_KEY", "VASTAI_API_KEY"),
+    # Cloudflare / R2D1 canonical bundle
     "R2D1_ACCOUNT_ID": (
         "R2D1_ACCOUNT_ID",
         "CLOUDFLARE_ACCOUNT_ID",
@@ -92,14 +91,15 @@ DEFAULT_SECRET_ALIASES: Mapping[str, tuple[str, ...]] = {
         "R2D1_R2_ACCESS_KEY",
         "R2_ACCESS_KEY",
         "R2_ACCESS_KEY_ID",
-        "R2_ACCESS_KEY_SECRET_ID",
+        "CLOUDFLARE_R2_ACCESS_KEY",
+        # Generic S3 envs last by design to avoid accidentally preferring AWS over R2-specific names.
         "AWS_ACCESS_KEY_ID",
     ),
     "R2D1_R2_SECRET_KEY": (
         "R2D1_R2_SECRET_KEY",
         "R2_SECRET_KEY",
         "R2_SECRET_ACCESS_KEY",
-        "R2_SECRET_ACCESS_KEY_SECRET",
+        "CLOUDFLARE_R2_SECRET_KEY",
         "AWS_SECRET_ACCESS_KEY",
     ),
     "R2D1_R2_ENDPOINT_URL": (
@@ -110,76 +110,75 @@ DEFAULT_SECRET_ALIASES: Mapping[str, tuple[str, ...]] = {
     ),
 }
 
-R2D1_REQUIRED_SECRET_NAMES: tuple[str, ...] = (
+COMMON_OPTIONAL_SECRETS: tuple[str, ...] = (
+    "HF_TOKEN",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "WANDB_API_KEY",
+    "KAGGLE_USERNAME",
+    "KAGGLE_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "COMET_API_KEY",
+    "NEPTUNE_API_TOKEN",
+    "MLFLOW_TRACKING_URI",
+    "MLFLOW_TRACKING_TOKEN",
+    "MODAL_TOKEN_ID",
+    "MODAL_TOKEN_SECRET",
+    "VAST_API_KEY",
+)
+
+R2_REQUIRED_SECRETS: tuple[str, ...] = (
+    "R2D1_ACCOUNT_ID",
+    "R2D1_R2_BUCKET",
+    "R2D1_R2_ACCESS_KEY",
+    "R2D1_R2_SECRET_KEY",
+)
+
+D1_OPTIONAL_SECRETS: tuple[str, ...] = (
+    "R2D1_API_TOKEN",
+    "R2D1_D1_DATABASE_ID",
+)
+
+R2D1_ALL_SECRETS: tuple[str, ...] = (
     "R2D1_ACCOUNT_ID",
     "R2D1_API_TOKEN",
     "R2D1_D1_DATABASE_ID",
     "R2D1_R2_BUCKET",
     "R2D1_R2_ACCESS_KEY",
     "R2D1_R2_SECRET_KEY",
-)
-
-R2D1_OPTIONAL_SECRET_NAMES: tuple[str, ...] = (
     "R2D1_R2_ENDPOINT_URL",
 )
 
-PLATFORM_ENV_NOTE = (
-    "Modal, Vast.ai, RunPod, Docker, GitHub Actions, SageMaker, Vertex AI "
-    "Workbench, Lightning AI, Paperspace, JupyterHub, Hugging Face Spaces, "
-    "and similar providers are covered when they inject secrets into os.environ."
-)
+_DOTENV_LOADED: set[Path] = set()
 
 
-@dataclass(frozen=True)
-class SecretLookup:
-    """Debug record for where a secret was found.
-
-    The secret value itself is included only because callers explicitly request a
-    lookup; do not print this object in logs.  For normal use prefer
-    ``secret(...)``, which returns just the string.
-    """
-
-    name: str
-    value: Optional[str]
-    found_as: Optional[str]
-    source: Optional[str]
-    candidates: tuple[str, ...]
-    checked: tuple[str, ...]
-
-    @property
-    def found(self) -> bool:
-        return bool(self.value)
+def _candidate_dotenv_paths(start: Path | None = None) -> list[Path]:
+    start = (start or Path.cwd()).resolve()
+    if start.is_file():
+        start = start.parent
+    paths: list[Path] = []
+    cur = start
+    while True:
+        p = cur / ".env"
+        if p.exists() and p.is_file():
+            paths.append(p)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return paths
 
 
-_DOTENV_LOADED: set[str] = set()
-
-
-def _unique_names(name: str, aliases: Optional[Iterable[str]] = None) -> list[str]:
-    out: list[str] = []
-    for item in [*DEFAULT_SECRET_ALIASES.get(name, (name,)), *(aliases or ())]:
-        s = str(item).strip()
-        if s and s not in out:
-            out.append(s)
-    return out
-
-
-def _strip_quotes(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-        return value[1:-1]
-    return value
-
-
-def _parse_dotenv_file(path: Path, *, override: bool = False) -> bool:
-    """Small fallback parser for KEY=value and export KEY=value lines."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-
+def _fallback_load_dotenv(path: Path) -> None:
+    """Small .env loader supporting KEY=VALUE and export KEY=VALUE."""
     line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$")
-    loaded_any = False
-    for raw in text.splitlines():
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -187,107 +186,75 @@ def _parse_dotenv_file(path: Path, *, override: bool = False) -> bool:
         if not m:
             continue
         key, value = m.group(1), m.group(2).strip()
-        # Strip a simple trailing comment for unquoted values.
-        if value and not value.startswith(("'", '"')) and " #" in value:
-            value = value.split(" #", 1)[0].rstrip()
-        value = _strip_quotes(value)
-        if override or key not in os.environ:
-            os.environ[key] = value
-            loaded_any = True
-    return loaded_any
+        if "#" in value and not value.startswith(("'", '"')):
+            value = value.split("#", 1)[0].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
-def _dotenv_candidates(dotenv_path: Optional[str | os.PathLike[str]]) -> list[Path]:
-    if dotenv_path is not None:
-        return [Path(dotenv_path).expanduser()]
-
-    # Notebook-friendly: .env in cwd or any parent.  python-dotenv's find_dotenv
-    # can be brittle inside notebooks depending on stack inspection, so we keep
-    # our own explicit fallback path list.
-    cwd = Path.cwd().resolve()
-    return [p / ".env" for p in [cwd, *cwd.parents]]
-
-
-def load_dotenv(
-    *,
-    dotenv_path: Optional[str | os.PathLike[str]] = None,
-    override: bool = False,
-) -> bool:
-    """Load a local .env file without making python-dotenv a hard runtime detail.
-
-    Existing environment variables are preserved unless ``override=True``.  The
-    function returns True if a candidate .env was found/loaded.
-    """
-    candidates = _dotenv_candidates(dotenv_path)
-
-    # Prefer python-dotenv when installed because it supports more syntax.
-    try:
-        from dotenv import load_dotenv as _load_dotenv  # type: ignore
-
-        for path in candidates:
-            if path.is_file():
-                key = str(path.resolve())
-                # Avoid re-loading the same file repeatedly during r2d1_config().
-                if override or key not in _DOTENV_LOADED:
-                    _load_dotenv(dotenv_path=path, override=override)
-                    _DOTENV_LOADED.add(key)
-                return True
-    except Exception:
-        pass
-
-    for path in candidates:
-        if path.is_file():
-            key = str(path.resolve())
-            if override or key not in _DOTENV_LOADED:
-                _parse_dotenv_file(path, override=override)
-                _DOTENV_LOADED.add(key)
-            return True
-    return False
+def load_dotenv(path: str | os.PathLike[str] | None = None) -> None:
+    """Best-effort .env loading. Existing os.environ values are not overwritten."""
+    paths = [Path(path).expanduser().resolve()] if path else _candidate_dotenv_paths()
+    for p in paths:
+        if p in _DOTENV_LOADED:
+            continue
+        try:
+            from dotenv import load_dotenv as _load_dotenv  # type: ignore
+            _load_dotenv(p, override=False)
+        except Exception:
+            _fallback_load_dotenv(p)
+        _DOTENV_LOADED.add(p)
 
 
-def _from_env(candidates: Iterable[str]) -> tuple[Optional[str], Optional[str]]:
-    for name in candidates:
-        value = os.environ.get(name)
-        if value:
-            return str(value), name
-    return None, None
+def names_for(name: str, aliases: Optional[Iterable[str]] = None) -> tuple[str, ...]:
+    names = list(DEFAULT_SECRET_ALIASES.get(name, (name,)))
+    for a in aliases or ():
+        if a not in names:
+            names.append(a)
+    return tuple(names)
 
 
-def _from_colab(candidates: Iterable[str]) -> tuple[Optional[str], Optional[str], str]:
+def _lookup_env(names: Iterable[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v, n, "environment/.env"
+    return None, None, None
+
+
+def _lookup_colab(names: Iterable[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
     try:
         from google.colab import userdata  # type: ignore
-    except Exception as exc:
-        return None, None, f"Google Colab userdata unavailable ({type(exc).__name__})"
-
-    for name in candidates:
+    except Exception:
+        return None, None, None
+    for n in names:
         try:
-            value = userdata.get(name)
+            v = userdata.get(n)
         except Exception:
-            value = None
-        if value:
-            return str(value), name, "Google Colab userdata"
-    return None, None, "Google Colab userdata checked"
+            v = None
+        if v:
+            return v, n, "Google Colab userdata"
+    return None, None, None
 
 
-def _from_kaggle(candidates: Iterable[str]) -> tuple[Optional[str], Optional[str], str]:
+def _lookup_kaggle(names: Iterable[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
     try:
         from kaggle_secrets import UserSecretsClient  # type: ignore
-    except Exception as exc:
-        return None, None, f"Kaggle UserSecretsClient unavailable ({type(exc).__name__})"
-
+    except Exception:
+        return None, None, None
     try:
         client = UserSecretsClient()
-    except Exception as exc:
-        return None, None, f"Kaggle UserSecretsClient unavailable ({type(exc).__name__})"
-
-    for name in candidates:
+    except Exception:
+        return None, None, None
+    for n in names:
         try:
-            value = client.get_secret(name)
+            v = client.get_secret(n)
         except Exception:
-            value = None
-        if value:
-            return str(value), name, "Kaggle UserSecretsClient"
-    return None, None, "Kaggle UserSecretsClient checked"
+            v = None
+        if v:
+            return v, n, "Kaggle UserSecretsClient"
+    return None, None, None
 
 
 def lookup_secret(
@@ -296,61 +263,40 @@ def lookup_secret(
     aliases: Optional[Iterable[str]] = None,
     set_env: bool = True,
     env_name: Optional[str] = None,
+    dotenv_path: str | os.PathLike[str] | None = None,
     load_dotenv_first: bool = True,
-    dotenv_path: Optional[str | os.PathLike[str]] = None,
 ) -> SecretLookup:
-    """Return detailed secret lookup info without raising.
-
-    Normal users should call :func:`secret`.  This function is useful for tests
-    and diagnostics because it records candidate names and checked locations.
-    """
-    candidates = tuple(_unique_names(name, aliases))
-    checked: list[str] = []
-
+    """Return structured lookup info without raising."""
+    tried = names_for(name, aliases)
     if load_dotenv_first:
-        found_dotenv = load_dotenv(dotenv_path=dotenv_path, override=False)
-        checked.append("local .env" + (" loaded" if found_dotenv else " not found"))
+        load_dotenv(dotenv_path)
 
-    value, found_as = _from_env(candidates)
-    checked.append("os.environ")
-    if value:
-        if set_env:
-            canonical = env_name or name
-            os.environ[canonical] = value
-            if found_as and found_as != canonical:
-                os.environ.setdefault(found_as, value)
-        return SecretLookup(name, value, found_as, "os.environ", candidates, tuple(checked))
+    value, found_as, source = _lookup_env(tried)
+    if not value:
+        value, found_as, source = _lookup_colab(tried)
+    if not value:
+        value, found_as, source = _lookup_kaggle(tried)
 
-    value, found_as, note = _from_colab(candidates)
-    checked.append(note)
-    if value:
-        if set_env:
-            canonical = env_name or name
-            os.environ[canonical] = value
-            if found_as and found_as != canonical:
-                os.environ.setdefault(found_as, value)
-        return SecretLookup(name, value, found_as, "Google Colab userdata", candidates, tuple(checked))
+    if value and set_env:
+        canonical = env_name or name
+        os.environ[canonical] = value
+        if found_as and found_as != canonical:
+            os.environ.setdefault(found_as, value)
 
-    value, found_as, note = _from_kaggle(candidates)
-    checked.append(note)
-    if value:
-        if set_env:
-            canonical = env_name or name
-            os.environ[canonical] = value
-            if found_as and found_as != canonical:
-                os.environ.setdefault(found_as, value)
-        return SecretLookup(name, value, found_as, "Kaggle UserSecretsClient", candidates, tuple(checked))
-
-    checked.append(PLATFORM_ENV_NOTE)
-    return SecretLookup(name, None, None, None, candidates, tuple(checked))
+    return SecretLookup(
+        name=name,
+        value=value,
+        found_as=found_as,
+        source=source,
+        tried_names=tried,
+    )
 
 
-def _missing_secret_message(name: str, result: SecretLookup) -> str:
+def _locations_text() -> str:
     return (
-        f"Missing required secret {name!r}.\n"
-        f"Tried names: {', '.join(result.candidates)}\n"
-        "Search locations checked:\n  - "
-        + "\n  - ".join(result.checked)
+        "local .env files, os.environ, Google Colab userdata, and Kaggle UserSecretsClient.\n"
+        "Platform-injected secrets from Modal, Vast.ai, RunPod, Docker, CI, SageMaker, Vertex, "
+        "Lightning AI, Paperspace, and similar providers are covered by os.environ."
     )
 
 
@@ -361,127 +307,102 @@ def secret(
     required: bool = True,
     set_env: bool = True,
     env_name: Optional[str] = None,
+    dotenv_path: str | os.PathLike[str] | None = None,
     load_dotenv_first: bool = True,
-    dotenv_path: Optional[str | os.PathLike[str]] = None,
 ) -> Optional[str]:
-    """Find a secret/token across common notebook and cloud environments.
-
-    Parameters
-    ----------
-    name:
-        Canonical environment variable name, e.g. ``HF_TOKEN`` or
-        ``R2D1_ACCOUNT_ID``.
-    aliases:
-        Extra variable/secret names to try after built-in aliases.
-    required:
-        Raise :class:`MissingSecretError` if not found.  If False, return None.
-    set_env:
-        If found, write the value into ``os.environ[env_name or name]``.  This
-        lets downstream libraries discover the token normally.
-    env_name:
-        Optional canonical environment variable name to populate.
-
-    Returns
-    -------
-    str | None
-        The discovered secret string, or None when ``required=False`` and the
-        secret is absent.
     """
-    result = lookup_secret(
+    Resolve a token/secret across common local, cloud, and notebook environments.
+
+    If found and set_env=True, the value is copied into os.environ[env_name or name].
+    If required=True and missing, MissingSecretError is raised only after all sources
+    have been tried.
+    """
+    info = lookup_secret(
         name,
         aliases=aliases,
         set_env=set_env,
         env_name=env_name,
-        load_dotenv_first=load_dotenv_first,
         dotenv_path=dotenv_path,
+        load_dotenv_first=load_dotenv_first,
     )
-    if result.value:
-        return result.value
+    if info.value:
+        return info.value
     if required:
-        raise MissingSecretError(_missing_secret_message(name, result))
+        raise MissingSecretError(
+            f"Missing required secret {name!r}.\n"
+            f"Tried names: {', '.join(info.tried_names)}\n"
+            f"Searched: {_locations_text()}"
+        )
     return None
 
 
 def require_secret(name: str, **kwargs) -> str:
-    """Strict variant of secret(...)."""
     value = secret(name, required=True, **kwargs)
     assert value is not None
     return value
-
-
-def r2d1_config(
-    *,
-    required: bool = True,
-    dotenv_path: Optional[str | os.PathLike[str]] = None,
-    set_env: bool = True,
-) -> dict[str, Optional[str]]:
-    """Load the Cloudflare R2/D1 credential bundle for Tracker.from_env().
-
-    Required names by default:
-        R2D1_ACCOUNT_ID, R2D1_API_TOKEN, R2D1_D1_DATABASE_ID,
-        R2D1_R2_BUCKET, R2D1_R2_ACCESS_KEY, R2D1_R2_SECRET_KEY
-
-    Optional:
-        R2D1_R2_ENDPOINT_URL
-    """
-    cfg: dict[str, Optional[str]] = {}
-    results: dict[str, SecretLookup] = {}
-
-    for name in [*R2D1_REQUIRED_SECRET_NAMES, *R2D1_OPTIONAL_SECRET_NAMES]:
-        result = lookup_secret(
-            name,
-            set_env=set_env,
-            dotenv_path=dotenv_path,
-        )
-        results[name] = result
-
-    mapping = {
-        "account_id": "R2D1_ACCOUNT_ID",
-        "api_token": "R2D1_API_TOKEN",
-        "d1_database_id": "R2D1_D1_DATABASE_ID",
-        "r2_bucket": "R2D1_R2_BUCKET",
-        "r2_access_key": "R2D1_R2_ACCESS_KEY",
-        "r2_secret_key": "R2D1_R2_SECRET_KEY",
-        "r2_endpoint_url": "R2D1_R2_ENDPOINT_URL",
-    }
-    for field, name in mapping.items():
-        cfg[field] = results[name].value
-
-    if not cfg.get("r2_endpoint_url") and cfg.get("account_id"):
-        cfg["r2_endpoint_url"] = f"https://{cfg['account_id']}.r2.cloudflarestorage.com"
-
-    missing = [name for name in R2D1_REQUIRED_SECRET_NAMES if not results[name].value]
-    if missing and required:
-        lines = ["Missing required R2D1 secrets:"]
-        for name in missing:
-            result = results[name]
-            lines.append(f"\n  {name}\n    tried names: {', '.join(result.candidates)}")
-        # The checked locations are identical enough to show once.
-        exemplar = results[missing[0]]
-        lines.append("\nSearch locations checked:\n  - " + "\n  - ".join(exemplar.checked))
-        raise MissingSecretError("\n".join(lines))
-
-    return cfg
 
 
 def export_secrets(
     names: Iterable[str] | Mapping[str, Iterable[str]],
     *,
     required: bool = False,
-    dotenv_path: Optional[str | os.PathLike[str]] = None,
 ) -> dict[str, Optional[str]]:
-    """Resolve several secrets and populate os.environ.
-
-    Examples
-    --------
-    >>> export_secrets(["HF_TOKEN", "GITHUB_TOKEN"], required=False)
-    >>> export_secrets({"HF_TOKEN": ["HF_HUB_TOKEN"]}, required=False)
-    """
+    """Resolve several secrets and populate os.environ for any that are found."""
     out: dict[str, Optional[str]] = {}
     if isinstance(names, Mapping):
         for name, aliases in names.items():
-            out[name] = secret(name, aliases=aliases, required=required, set_env=True, dotenv_path=dotenv_path)
+            out[name] = secret(name, aliases=aliases, required=required, set_env=True)
     else:
         for name in names:
-            out[name] = secret(name, required=required, set_env=True, dotenv_path=dotenv_path)
+            out[name] = secret(name, required=required, set_env=True)
     return out
+
+
+def discover_common_secrets(*, required: bool = False) -> dict[str, Optional[str]]:
+    """Opportunistically load common ML/dev tokens such as HF_TOKEN and GITHUB_TOKEN."""
+    return export_secrets(COMMON_OPTIONAL_SECRETS, required=required)
+
+
+def r2d1_config(*, discover_common_tokens: bool = True) -> dict[str, Optional[str]]:
+    """
+    Resolve the R2D1 credential bundle without raising.
+
+    R2 is validated lazily when a job/checkpoint is started. D1 is optional.
+    """
+    if discover_common_tokens:
+        discover_common_secrets(required=False)
+    return {
+        "account_id": secret("R2D1_ACCOUNT_ID", required=False),
+        "api_token": secret("R2D1_API_TOKEN", required=False),
+        "d1_database_id": secret("R2D1_D1_DATABASE_ID", required=False),
+        "r2_bucket": secret("R2D1_R2_BUCKET", required=False),
+        "r2_access_key": secret("R2D1_R2_ACCESS_KEY", required=False),
+        "r2_secret_key": secret("R2D1_R2_SECRET_KEY", required=False),
+        "r2_endpoint_url": secret("R2D1_R2_ENDPOINT_URL", required=False),
+    }
+
+
+def missing_r2(cfg: Mapping[str, Optional[str]]) -> list[str]:
+    checks = {
+        "R2D1_ACCOUNT_ID": cfg.get("account_id"),
+        "R2D1_R2_BUCKET": cfg.get("r2_bucket"),
+        "R2D1_R2_ACCESS_KEY": cfg.get("r2_access_key"),
+        "R2D1_R2_SECRET_KEY": cfg.get("r2_secret_key"),
+    }
+    return [k for k, v in checks.items() if not v]
+
+
+def missing_d1(cfg: Mapping[str, Optional[str]]) -> list[str]:
+    checks = {
+        "R2D1_API_TOKEN": cfg.get("api_token"),
+        "R2D1_D1_DATABASE_ID": cfg.get("d1_database_id"),
+    }
+    return [k for k, v in checks.items() if not v]
+
+
+def missing_error(kind: str, missing: Iterable[str]) -> MissingSecretError:
+    lines = [f"Missing required {kind} credentials:"]
+    for name in missing:
+        lines.append(f"  - {name}  (aliases: {', '.join(names_for(name))})")
+    lines.append(f"Searched: {_locations_text()}")
+    return MissingSecretError("\n".join(lines))
