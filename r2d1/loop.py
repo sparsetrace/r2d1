@@ -1,100 +1,206 @@
 """
-r2d1 loop utilities — tqdm-style EpochLoop and @tracker.job decorator.
+r2d1 loop utilities.
+
+The exported `r2d1` class is intentionally lowercase, like tqdm:
+
+    from r2d1 import r2d1
+
+    for epoch in r2d1(range(400), job=job):
+        epoch.d1(loss=...)
+        if epoch.should_checkpoint:
+            epoch.r2({"model.safetensors": Path("model.safetensors")})
 """
-import time
+from __future__ import annotations
+
 import functools
+import time
+from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 
 
-class EpochContext:
+class Epoch:
     """
-    Yielded each iteration by EpochLoop.
-    Set .loss, .accuracy, .files during the epoch body.
-    All are flushed to D1 / R2 automatically at end of iteration.
+    Context object yielded by r2d1(...).
+
+    Methods
+    -------
+    d1(metrics=None, **kwargs)
+        Queue small JSON-serializable metrics/metadata for D1.
+
+    r2(files)
+        Queue files/artifacts/checkpoints for R2.
+
+    Aliases
+    -------
+    log == d1
+    checkpoint == r2
     """
-    def __init__(self, epoch_num):
-        self.epoch    = epoch_num
-        self.loss     = None
-        self.accuracy = None
-        self.files    = None   # dict of filename → bytes, shipped to R2
+
+    def __init__(self, i: int, *, job: Any, should_log: bool, should_checkpoint: bool):
+        self.i = int(i)
+        self.epoch = int(i)
+        self.job = job
+        self.should_log = bool(should_log)
+        self.should_checkpoint = bool(should_checkpoint)
+        self._metrics: Dict[str, Any] = {}
+        self._files: Optional[Mapping[str, Any]] = None
+
+    def d1(self, metrics: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+        """Queue metrics/metadata to be written to D1 at the end of this iteration."""
+        data: Dict[str, Any] = {}
+        if metrics:
+            data.update(dict(metrics))
+        data.update(kwargs)
+        self._metrics.update(data)
+        return self._metrics
+
+    log = d1
+
+    def r2(self, files: Mapping[str, Any]) -> Mapping[str, Any]:
+        """
+        Queue artifacts/checkpoint files to be uploaded to R2.
+
+        Supported values include pathlib.Path, bytes, bytearray, str, dict/list JSON,
+        and file-like objects. Paths are streamed; bytes are uploaded in-memory.
+        """
+        self._files = files
+        return files
+
+    checkpoint = r2
 
 
-class EpochLoop:
+class r2d1:
     """
-    tqdm-style wrapper for your epoch loop. Auto-times, logs to D1, ships
-    checkpoint files to R2.
-
-    for epoch in EpochLoop(range(400), job=job):
-        loss = train_step(...)         # jit'd / multi-GPU — completely untouched
-        epoch.loss  = float(loss)
-        epoch.files = model.checkpoint()   # your model packages its own files
+    tqdm-style epoch loop wrapper.
 
     Parameters
     ----------
-    iterable         : range or list of epoch numbers
-    job              : r2d1 Job handle
-    checkpoint_every : upload files every N epochs (default: 1)
-    log_every        : log to D1 every N epochs (default: 1)
-    start_epoch      : skip epochs before this number (for resuming)
-    async_checkpoint : upload in background while GPU trains (default: True)
+    iterable:
+        Iterable of epoch numbers, usually range(num_epochs).
+    job:
+        r2d1 Job handle returned by tracker.start_job/resume_job or injected by
+        @tracker.job.
+    log_every:
+        Write metrics to D1 every N epochs.
+    checkpoint_every:
+        Upload queued R2 files every N epochs.
+    keep_last:
+        Number of rotating R2 checkpoint slots to keep. Default 2.
+    start_epoch:
+        Skip epochs before this value, for resuming.
+    async_checkpoint:
+        Upload R2 files in a background thread. D1 checkpoint pointer is updated
+        only after upload + manifest succeed.
+    progress:
+        Print compact progress lines.
     """
 
-    def __init__(self, iterable, job,
-                 checkpoint_every=1, log_every=1,
-                 start_epoch=0, async_checkpoint=True):
-        self._iter             = iterable
-        self._job              = job
-        self._checkpoint_every = checkpoint_every
-        self._log_every        = log_every
-        self._start_epoch      = start_epoch
-        self._async            = async_checkpoint
+    def __init__(
+        self,
+        iterable: Iterable[int],
+        *,
+        job: Any,
+        log_every: int = 1,
+        checkpoint_every: int = 1,
+        keep_last: int = 2,
+        start_epoch: int = 0,
+        async_checkpoint: bool = True,
+        progress: bool = True,
+    ):
+        if log_every <= 0:
+            raise ValueError("log_every must be >= 1")
+        if checkpoint_every <= 0:
+            raise ValueError("checkpoint_every must be >= 1")
+        if keep_last <= 0:
+            raise ValueError("keep_last must be >= 1")
 
-    def __iter__(self):
-        epochs = list(self._iter)
-        total  = max(epochs) if epochs else 0
+        self.iterable = iterable
+        self.job = job
+        self.log_every = int(log_every)
+        self.checkpoint_every = int(checkpoint_every)
+        self.keep_last = int(keep_last)
+        self.start_epoch = int(start_epoch)
+        self.async_checkpoint = bool(async_checkpoint)
+        self.progress = bool(progress)
 
-        for i in epochs:
-            if i < self._start_epoch:
+    def __iter__(self) -> Iterator[Epoch]:
+        try:
+            total = len(self.iterable)  # type: ignore[arg-type]
+        except Exception:
+            total = None
+
+        for raw_i in self.iterable:
+            i = int(raw_i)
+            if i < self.start_epoch:
                 continue
 
-            ctx = EpochContext(i)
-            t0  = time.time()
+            should_log = (i % self.log_every) == 0
+            should_checkpoint = (i % self.checkpoint_every) == 0
+            epoch = Epoch(i, job=self.job, should_log=should_log, should_checkpoint=should_checkpoint)
+            t0 = time.time()
 
-            yield ctx   # ← your training code runs here
+            yield epoch
 
-            duration = time.time() - t0
+            duration_sec = round(time.time() - t0, 3)
 
-            # Log metrics to D1
-            if i % self._log_every == 0:
-                self._job.log(
-                    epoch=i,
-                    loss=ctx.loss,
-                    accuracy=ctx.accuracy,
-                    duration_sec=round(duration, 3),
-                )
+            if epoch.should_log:
+                self.job.d1(epoch=i, duration_sec=duration_sec, metrics=epoch._metrics)
 
-            # Ship checkpoint files to R2
-            if ctx.files and i % self._checkpoint_every == 0:
-                if self._async:
-                    self._job.save_async(i, ctx.files, loss=ctx.loss)
+            if epoch._files is not None and epoch.should_checkpoint:
+                if self.async_checkpoint:
+                    self.job.r2_async(
+                        epoch=i,
+                        files=epoch._files,
+                        metrics=epoch._metrics,
+                        keep_last=self.keep_last,
+                        checkpoint_every=self.checkpoint_every,
+                    )
                 else:
-                    self._job.save(i, ctx.files, loss=ctx.loss)
+                    self.job.r2(
+                        epoch=i,
+                        files=epoch._files,
+                        metrics=epoch._metrics,
+                        keep_last=self.keep_last,
+                        checkpoint_every=self.checkpoint_every,
+                    )
 
-            # Progress line
-            loss_str = f"  loss={ctx.loss:.4f}" if ctx.loss is not None else ""
-            acc_str  = f"  acc={ctx.accuracy:.4f}" if ctx.accuracy is not None else ""
-            print(f"[r2d1] epoch {i}/{total}  {duration:.1f}s{loss_str}{acc_str}")
+            if self.progress:
+                self._print_progress(i, total, duration_sec, epoch._metrics)
 
-        # Always flush last async upload before loop exits
-        self._job.wait()
+        self.job.wait()
+
+    @staticmethod
+    def _print_progress(i: int, total: Optional[int], duration_sec: float, metrics: Mapping[str, Any]) -> None:
+        pieces = [f"[r2d1] epoch {i}"]
+        if total is not None:
+            pieces[0] += f"/{max(total - 1, 0)}"
+        pieces.append(f"{duration_sec:.1f}s")
+
+        loss = metrics.get("loss") if metrics else None
+        acc = metrics.get("accuracy", metrics.get("acc")) if metrics else None
+        if isinstance(loss, (int, float)):
+            pieces.append(f"loss={loss:.4f}")
+        if isinstance(acc, (int, float)):
+            pieces.append(f"acc={acc:.4f}")
+        print("  ".join(pieces), flush=True)
 
 
-def job_decorator(tracker, name, dataset_key=None,
-                  dataset_size_mb=None, resume_job_id=None):
+def job_decorator(
+    tracker: Any,
+    *,
+    name: str,
+    dataset_key: Optional[str] = None,
+    dataset_size_mb: Optional[float] = None,
+    config: Optional[Mapping[str, Any]] = None,
+    tags: Optional[Iterable[str]] = None,
+    resume_job_id: Optional[int] = None,
+):
     """
-    Returns a decorator that wraps a training function with job lifecycle.
-    The decorated function receives a Job as its first argument.
-    Calls job.interrupt() on any exception, job.complete() on clean exit.
+    Return a decorator that injects a Job as the first argument.
+
+    Clean exit -> job.complete().
+    Exception/KeyboardInterrupt -> job.interrupt(), then re-raise.
     """
+
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -105,14 +211,17 @@ def job_decorator(tracker, name, dataset_key=None,
                     name=name,
                     dataset_key=dataset_key,
                     dataset_size_mb=dataset_size_mb,
+                    config=config,
+                    tags=list(tags) if tags is not None else None,
                 )
             try:
                 result = fn(job, *args, **kwargs)
                 job.complete()
                 return result
-            except (KeyboardInterrupt, Exception):
+            except BaseException:
                 job.interrupt()
                 raise
 
         return wrapper
+
     return decorator
