@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "r2d1"
-version = "0.1.0"
+version = "0.1.4"
 description = "Tiny ML experiment tracking on Cloudflare R2 + D1"
 readme = "README.md"
 requires-python = ">=3.9"
