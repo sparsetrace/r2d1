@@ -3,38 +3,24 @@
 Tiny ML experiment tracking on Cloudflare **R2** + **D1**.
 
 ```python
-from pathlib import Path
 from r2d1 import Tracker, r2d1
 
 tracker = Tracker.from_env()
 
-@tracker.job(
-    name="dit_imagenet_sm103_test",
-    dataset_key="hf://datasets/imagenet-1k",
-    config={"model": "DiT", "hardware": "sm103", "dtype": "bf16"},
-    tags=["dit", "imagenet", "sm103"],
-)
-def train(job):
-    for epoch in r2d1(range(400), job=job, log_every=1, checkpoint_every=10, keep_last=2):
-        loss = train_step(...)
+job = tracker.start_job("mnist_dit")
 
-        # Small structured data -> D1
-        epoch.d1(
-            loss=float(loss),
-            lr=float(lr),
-            samples_per_sec=float(samples_per_sec),
-        )
+for epoch in r2d1(range(10), job=job, checkpoint_every=1, keep_last=2):
+    loss = train_step(...)
 
-        # Big files/artifacts/checkpoints -> R2
-        if epoch.should_checkpoint:
-            save_checkpoint_to_disk(model, optimizer, "ckpt/")
-            epoch.r2({
-                "model.safetensors": Path("ckpt/model.safetensors"),
-                "optimizer.safetensors": Path("ckpt/optimizer.safetensors"),
-                "config.json": {"epoch": epoch.i, "model": "DiT"},
-            })
+    epoch.d1(loss=float(loss), lr=float(lr))
 
-train()
+    if epoch.should_checkpoint:
+        epoch.r2({
+            "checkpoint.pt": "ckpt/checkpoint.pt",
+            "config.json": {"epoch": epoch.i},
+        })
+
+job.complete()
 ```
 
 ## Mental model
