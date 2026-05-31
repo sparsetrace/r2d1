@@ -1,157 +1,176 @@
 # r2d1
 
-Lightweight ML experiment tracker using Cloudflare **R2** (checkpoints) + **D1** (metrics & metadata).
-
-- **Agnostic** — ships whatever files your model produces. Zero opinion on format.
-- Works with **PyTorch, JAX, or anything else**
-- Runs anywhere — local, Colab, vast.ai, any GPU server
-- Async checkpoint uploads — GPU keeps training while files ship to R2
-
-```bash
-pip install r2d1
-```
-
----
-
-## How it works
-
-```
-Your model                        r2d1
-----------                        ----
-model.safetensors  ──────────→   ships to R2
-config.json        ──────────→   jobs/job_3/epoch_42/
-run.log            ──────────→
-
-loss, accuracy, duration  ──→   logs to D1  (live feed for you, Alice, team)
-```
-
-D1 always gets: `epoch`, `loss`, `accuracy`, `duration_sec`, `timestamp`.  
-R2 gets: whatever files you put in `epoch.files`. r2d1 never opens them.
-
----
-
-## Setup
+Tiny ML experiment tracking on Cloudflare **R2** + **D1**.
 
 ```python
-from r2d1 import Tracker, EpochLoop
+from pathlib import Path
+from r2d1 import Tracker, r2d1
 
-tracker = Tracker(
-    account_id     = "your_cloudflare_account_id",
-    api_token      = "your_cloudflare_api_token",   # Token value from R2 API token
-    d1_database_id = "your_d1_database_id",
-    r2_bucket      = "your_bucket_name",
-    r2_access_key  = "your_r2_access_key",
-    r2_secret_key  = "your_r2_secret_key",
+tracker = Tracker.from_env()
+
+@tracker.job(
+    name="dit_imagenet_sm103_test",
+    dataset_key="hf://datasets/imagenet-1k",
+    config={"model": "DiT", "hardware": "sm103", "dtype": "bf16"},
+    tags=["dit", "imagenet", "sm103"],
 )
-# D1 tables created automatically on first run
+def train(job):
+    for epoch in r2d1(range(400), job=job, log_every=1, checkpoint_every=10, keep_last=2):
+        loss = train_step(...)
+
+        # Small structured data -> D1
+        epoch.d1(
+            loss=float(loss),
+            lr=float(lr),
+            samples_per_sec=float(samples_per_sec),
+        )
+
+        # Big files/artifacts/checkpoints -> R2
+        if epoch.should_checkpoint:
+            save_checkpoint_to_disk(model, optimizer, "ckpt/")
+            epoch.r2({
+                "model.safetensors": Path("ckpt/model.safetensors"),
+                "optimizer.safetensors": Path("ckpt/optimizer.safetensors"),
+                "config.json": {"epoch": epoch.i, "model": "DiT"},
+            })
+
+train()
 ```
 
----
+## Mental model
 
-## Usage
-
-### tqdm-style loop
-
-```python
-job = tracker.start_job("dit_run1", dataset_key="hf://datasets/imagenet-1k")
-
-try:
-    for epoch in EpochLoop(range(400), job=job):
-
-        loss = train_step(...)      # your JIT'd / multi-GPU code — untouched
-
-        epoch.loss  = float(loss)
-        epoch.files = {             # your model packages its own checkpoint
-            "model.safetensors": model.to_safetensors_bytes(),
-            "config.json":       model.to_config_bytes(),
-            "run.log":           logger.flush_bytes(),
-        }
-        # ↑ files upload async to R2, loss logs to D1 — both happen automatically
-
-    job.complete()
-
-except Exception:
-    job.interrupt()   # D1 status → 'interrupted', Alice can restart
-    raise
+```text
+epoch.d1({...})  -> small JSON metrics/metadata -> D1
+epoch.r2({...})  -> files/artifacts/checkpoints -> R2
 ```
 
-### Resume after interruption
+Aliases are included:
 
 ```python
-job = tracker.resume_job(job_id=3)
+epoch.log(...)        # same as epoch.d1(...)
+epoch.checkpoint(...) # same as epoch.r2(...)
+```
 
-files = job.load_latest()   # downloads all files from last checkpoint
-# files["model.safetensors"], files["config.json"], etc.
+The loop is intentionally lowercase like `tqdm`:
 
-model  = MyModel.from_safetensors_bytes(files["model.safetensors"],
-                                        files["config.json"])
-logger = Logger.from_bytes(files["run.log"])
+```python
+from r2d1 import r2d1
 
-for epoch in EpochLoop(range(400), job=job, start_epoch=last_epoch + 1):
+for epoch in r2d1(range(100), job=job):
     ...
 ```
 
-### Decorator style
+## Install locally
 
-```python
-@tracker.job(name="dit_run1", dataset_key="hf://datasets/imagenet-1k")
-def train(job):
-    for epoch in EpochLoop(range(400), job=job):
-        loss = train_step(...)
-        epoch.loss  = float(loss)
-        epoch.files = model.checkpoint()
-
-train()   # start/interrupt/complete handled automatically
+```bash
+pip install -e .
 ```
 
-### EpochLoop options
+## Cloudflare credentials
+
+`Tracker.from_env()` reads:
+
+```bash
+export R2D1_ACCOUNT_ID="..."
+export R2D1_API_TOKEN="..."
+export R2D1_D1_DATABASE_ID="..."
+export R2D1_R2_BUCKET="..."
+export R2D1_R2_ACCESS_KEY="..."
+export R2D1_R2_SECRET_KEY="..."
+# optional:
+export R2D1_R2_ENDPOINT_URL="https://<account_id>.r2.cloudflarestorage.com"
+```
+
+Or construct directly:
 
 ```python
-EpochLoop(
-    range(400),
-    job              = job,
-    checkpoint_every = 10,    # ship files every 10 epochs (default: 1)
-    log_every        = 1,     # log to D1 every epoch (default: 1)
-    start_epoch      = 50,    # skip first 50 epochs — for resuming
-    async_checkpoint = True,  # upload in background (default: True)
+tracker = Tracker(
+    account_id="...",
+    api_token="...",
+    d1_database_id="...",
+    r2_bucket="...",
+    r2_access_key="...",
+    r2_secret_key="...",
 )
 ```
 
----
+## Checkpoint rotation: keep only last two
 
-## R2 layout
+Use `keep_last=2`:
 
-```
-r2://your-bucket/
-└── jobs/
-    └── job_3/
-        ├── epoch_0/
-        │   ├── model.safetensors
-        │   ├── config.json
-        │   └── run.log
-        ├── epoch_10/
-        │   └── ...
-        └── epoch_42/
-            └── ...
+```python
+for epoch in r2d1(range(400), job=job, checkpoint_every=10, keep_last=2):
+    if epoch.should_checkpoint:
+        epoch.r2({"model.safetensors": Path("model.safetensors")})
 ```
 
----
+R2 layout:
 
-## D1 schema (auto-created)
+```text
+jobs/job_3/checkpoints/slot_0/
+  manifest.json
+  model.safetensors
 
-**jobs** — `id`, `name`, `dataset_key`, `status`, `last_checkpoint_prefix`, `submitted_at`, `updated_at`  
-**epochs** — `job_id`, `epoch`, `loss`, `accuracy`, `duration_sec`, `logged_at`
-
----
-
-## Files
-
+jobs/job_3/checkpoints/slot_1/
+  manifest.json
+  model.safetensors
 ```
-r2d1/
-├── r2d1/
-│   ├── __init__.py   # exports Tracker, Job, EpochLoop
-│   ├── tracker.py    # Tracker + Job — R2 upload, D1 logging
-│   └── loop.py       # EpochLoop + @tracker.job decorator
-├── setup.py
-└── README.md
+
+Epoch 0 writes `slot_0`, epoch 10 writes `slot_1`, epoch 20 overwrites `slot_0`, etc. D1 only points at a checkpoint after the files and `manifest.json` have been uploaded successfully.
+
+## D1 schema
+
+`r2d1` creates three tables automatically:
+
+- `jobs`: run lifecycle + latest checkpoint pointer
+- `epochs`: per-epoch metrics, with fixed columns plus `metrics_json`
+- `checkpoints`: committed checkpoint manifests
+
+`epoch.d1(...)` stores both convenience columns and a full JSON payload:
+
+```python
+epoch.d1({
+    "loss": 0.123,
+    "lr": 3e-4,
+    "fid": 18.2,
+    "gpu": "B300",
+})
 ```
+
+## R2 inputs
+
+`epoch.r2(...)` accepts:
+
+- `Path` objects — streamed to R2, preferred for large checkpoints
+- `bytes` / `bytearray`
+- `str` — existing file path if it exists, otherwise UTF-8 text
+- `dict` / `list` / JSON-ish objects — encoded as JSON
+- file-like objects — spooled to a temp file, then uploaded
+
+Example:
+
+```python
+epoch.r2({
+    "model.safetensors": Path("ckpt/model.safetensors"),
+    "config.json": {"hidden_size": 1152, "depth": 28},
+    "notes.txt": "loss looked stable",
+})
+```
+
+## Resume
+
+```python
+job = tracker.resume_job(3)
+files, manifest = job.load_latest(include_manifest=True)
+
+print(manifest["epoch"])
+model_bytes = files["model.safetensors"]
+```
+
+`load_latest()` validates file SHA256 hashes against the manifest.
+
+## Optional serialization helpers
+
+Core r2d1 does not own model serialization. It ships whatever you provide.
+
+There is an optional `r2d1.checkpoint` module for small/simple PyTorch/JAX cases, but for real training runs prefer framework-native checkpoint files such as `safetensors`, Orbax, Flax serialization, `torch.save`, etc., then pass those file paths to `epoch.r2(...)`.
