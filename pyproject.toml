@@ -4,15 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "r2d1"
-version = "0.1.4"
+version = "0.1.5"
 description = "Tiny ML experiment tracking on Cloudflare R2 + D1"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-authors = [{name = "SparseTrace"}]
+authors = [{name = "r2d1 authors"}]
 dependencies = [
     "boto3>=1.28",
     "requests>=2.31",
+    "python-dotenv>=1.0",
+    "numpy>=1.23",
 ]
 keywords = ["machine-learning", "experiment-tracking", "cloudflare", "r2", "d1", "checkpoint"]
 classifiers = [

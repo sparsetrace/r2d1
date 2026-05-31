@@ -1,21 +1,18 @@
-from setuptools import setup, find_packages
 from pathlib import Path
-
-ROOT = Path(__file__).parent
-README = ROOT / "README.md"
+from setuptools import setup, find_packages
 
 setup(
     name="r2d1",
-    version="0.1.4",
-    author="SparseTrace",
+    version="0.1.5",
     description="Lightweight ML experiment tracker — Cloudflare R2 checkpoints + D1 metrics",
-    long_description=README.read_text(encoding="utf-8"),
+    long_description=Path("README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
     packages=find_packages(),
     install_requires=[
         "boto3>=1.28",
-        "requests>=2.28",
+        "requests>=2.31",
         "numpy>=1.23",
+        "python-dotenv>=1.0",
     ],
     extras_require={
         "torch": ["torch"],
@@ -35,5 +32,7 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
     ],
 )
