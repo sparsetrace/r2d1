@@ -1,86 +1,28 @@
 # r2d1
 
-Tiny ML experiment tracking on Cloudflare **R2** + **D1**.
+Lightweight ML checkpoint courier using Cloudflare **R2** for durable artifacts and optional **D1** for metrics/metadata.
 
-- **R2** stores checkpoint/artifact files.
-- **D1** stores job metadata, epoch metrics, and checkpoint pointers.
-- Works from local scripts, notebooks, Colab, Kaggle, Vast.ai, Modal, RunPod, Docker, CI, and ordinary GPU servers.
-- Keeps training code framework-agnostic: PyTorch, JAX, or anything that can write files.
+`r2d1` does not care how your model checkpoints are formatted. It ships whatever files or JSON blobs you hand it.
 
 ```bash
 pip install r2d1
 ```
 
-## 0.1.5 credential discovery
-
-`r2d1` now has a universal secret resolver:
-
-```python
-from r2d1 import secret
-
-hf_token = secret("HF_TOKEN", aliases=["HF_HUB_TOKEN"], required=False)
-github_token = secret("GITHUB_TOKEN", aliases=["GH_TOKEN"], required=False)
-```
-
-The resolver searches:
-
-1. `.env` in the current directory or parents, with `override=False`
-2. `os.environ`
-3. Google Colab secrets via `google.colab.userdata`, when available
-4. Kaggle secrets via `kaggle_secrets.UserSecretsClient`, when available
-
-Modal, Vast.ai, RunPod, Docker, GitHub Actions, SageMaker, Vertex AI Workbench, Lightning AI, Paperspace, JupyterHub, Hugging Face Spaces, and similar platforms are covered when they inject secrets as environment variables.
-
-By default, found secrets are copied into `os.environ[NAME]`, so downstream libraries can see them too.
-
-## R2D1 credentials
-
-Put these in a private `.env`, notebook secret store, Modal secret, Vast.ai env vars, or your shell environment:
-
-```bash
-export R2D1_ACCOUNT_ID="..."
-export R2D1_API_TOKEN="..."
-export R2D1_D1_DATABASE_ID="..."
-export R2D1_R2_BUCKET="..."
-export R2D1_R2_ACCESS_KEY="..."
-export R2D1_R2_SECRET_KEY="..."
-# optional:
-export R2D1_R2_ENDPOINT_URL="https://<account_id>.r2.cloudflarestorage.com"
-```
-
-Then use:
-
-```python
-from r2d1 import Tracker
-
-tracker = Tracker.from_env()
-```
-
-`Tracker.from_env()` is strict by default. If any required R2D1 key is missing, it raises `MissingSecretError` listing all names and environments it tried.
-
-## Basic usage
+## Core idea
 
 ```python
 from pathlib import Path
-from r2d1 import Tracker, r2d1
+from r2d1 import start_job, r2d1
 
-tracker = Tracker.from_env()
-job = tracker.start_job(
-    "mnist_dit",
-    dataset_key="hf://datasets/ylecun/mnist",
-    config={"model": "tiny-pixel-dit"},
-    tags=["mnist", "flow-matching"],
-)
+job = start_job("mnist_dit")
 
 for epoch in r2d1(range(10), job=job, checkpoint_every=1, keep_last=2):
     loss = train_one_epoch(...)
 
-    # small JSON metrics/metadata -> D1
-    epoch.d1(loss=float(loss), lr=float(lr))
+    epoch.d1(loss=float(loss))  # optional D1 metrics if D1 is configured
 
-    # files/artifacts/checkpoints -> R2
     if epoch.should_checkpoint:
-        epoch.r2({
+        epoch.r2({              # durable artifacts/checkpoints to R2
             "checkpoint.pt": Path("ckpt/checkpoint.pt"),
             "config.json": {"epoch": epoch.i},
         })
@@ -88,82 +30,103 @@ for epoch in r2d1(range(10), job=job, checkpoint_every=1, keep_last=2):
 job.complete()
 ```
 
-Aliases are provided:
+## Credentials
 
-```python
-epoch.log(...)        # same as epoch.d1(...)
-epoch.checkpoint(...) # same as epoch.r2(...)
+`r2d1` searches for secrets in:
+
+1. `.env` in the current directory or parent directories
+2. `os.environ`
+3. Google Colab secrets via `google.colab.userdata`
+4. Kaggle notebook secrets via `kaggle_secrets.UserSecretsClient`
+
+Modal, Vast.ai, RunPod, Docker, CI, SageMaker, Vertex, Lightning AI, Paperspace, etc. are covered when those platforms inject secrets into environment variables.
+
+### Required for R2 checkpointing
+
+```bash
+export R2D1_ACCOUNT_ID="..."
+export R2D1_R2_BUCKET="..."
+export R2D1_R2_ACCESS_KEY="..."
+export R2D1_R2_SECRET_KEY="..."
+# optional:
+export R2D1_R2_ENDPOINT_URL="https://<account_id>.r2.cloudflarestorage.com"
 ```
 
-## Decorator style
+Aliases such as `CLOUDFLARE_ACCOUNT_ID`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_KEY`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` are also recognized. `R2D1_*` names take priority.
 
-```python
-from r2d1 import Tracker, r2d1
+### Optional for D1 metrics/status
 
-tracker = Tracker.from_env()
-
-@tracker.job(name="dit_run", dataset_key="hf://datasets/ylecun/mnist")
-def train(job):
-    for epoch in r2d1(range(10), job=job, checkpoint_every=1, keep_last=2):
-        loss = train_one_epoch(...)
-        epoch.d1(loss=float(loss))
-        if epoch.should_checkpoint:
-            epoch.r2({"checkpoint.pt": "ckpt/checkpoint.pt"})
-
-train()
+```bash
+export R2D1_API_TOKEN="..."
+export R2D1_D1_DATABASE_ID="..."
 ```
 
-Clean exit marks the job completed. Exceptions/interrupts mark it interrupted.
+If D1 credentials are missing, `r2d1` prints a warning and continues in R2-only mode.
 
-## Rotating checkpoints
+## Secret utility
 
-`keep_last=2` uses rotating R2 slots:
-
-```text
-jobs/job_3/checkpoints/slot_0/
-jobs/job_3/checkpoints/slot_1/
-```
-
-Each upload writes files first, then `manifest.json`, then updates D1. D1 only points at complete checkpoints.
-
-## Resume
-
-```python
-tracker = Tracker.from_env()
-job = tracker.resume_job(3)
-files, manifest = job.load_latest(include_manifest=True)
-
-# files["checkpoint.pt"] contains checkpoint bytes.
-# manifest["epoch"] tells you where to resume.
-```
-
-## Universal secrets for notebooks/cloud jobs
+You can use `r2d1` as a general notebook/cloud secret resolver:
 
 ```python
 from r2d1 import secret, export_secrets
 
-# Optional secrets, no error if missing.
 hf_token = secret("HF_TOKEN", aliases=["HF_HUB_TOKEN"], required=False)
 github_token = secret("GITHUB_TOKEN", aliases=["GH_TOKEN"], required=False)
 
-# Load several and populate os.environ.
 export_secrets(["HF_TOKEN", "GITHUB_TOKEN", "WANDB_API_KEY"], required=False)
 ```
 
-Strict mode:
+If found, values are copied into `os.environ` so downstream libraries can use them.
+
+## Top-level API
+
+The common path does not require `Tracker.from_env()`:
 
 ```python
-github_token = secret("GITHUB_TOKEN")  # raises MissingSecretError if absent
+from r2d1 import start_job, r2d1
+
+job = start_job("my_run")
+for epoch in r2d1(range(100), job=job):
+    ...
 ```
 
-No secret values are logged by r2d1.
+Advanced/manual path:
 
-## Install extras
+```python
+from r2d1 import Tracker
+
+tracker = Tracker.from_env()  # lazy; does not require R2/D1 immediately
+job = tracker.start_job("my_run")  # validates R2 here, warns if D1 is missing
+```
+
+## Last-two checkpoints
+
+By default, `keep_last=2` rotates checkpoint uploads through two R2 slots:
+
+```text
+jobs/<job_id>/checkpoints/slot_0/
+jobs/<job_id>/checkpoints/slot_1/
+```
+
+With `checkpoint_every=10`, epochs `0, 10, 20, 30` map to `slot_0, slot_1, slot_0, slot_1`. Use stable artifact names like `checkpoint.pt` so R2 storage stays bounded.
+
+## R2-only mode
+
+D1 is useful but optional. In R2-only mode, `epoch.r2(...)` still uploads checkpoints and writes:
+
+```text
+jobs/<job_id>/job.json
+jobs/<job_id>/latest.json
+jobs/<job_id>/checkpoints/slot_*/manifest.json
+```
+
+`epoch.d1(...)` warns once and does not write SQL metrics.
+
+## Build/publish
 
 ```bash
-pip install r2d1[torch]
-pip install r2d1[jax]
-pip install r2d1[dev]
+python -m pip install -U build twine
+python -m build
+twine check dist/*
+twine upload dist/*
 ```
-
-`r2d1` does not own your model serialization. Prefer framework-native or safe formats such as `.safetensors`, PyTorch `.pt`, Orbax/Flax outputs, JSON configs, logs, images, etc. `epoch.r2(...)` ships the files you provide.

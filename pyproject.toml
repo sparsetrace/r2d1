@@ -1,34 +1,23 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "r2d1"
-version = "0.1.5"
-description = "Tiny ML experiment tracking on Cloudflare R2 + D1"
+version = "0.1.6"
+description = "Lightweight ML checkpoint courier — Cloudflare R2 storage + optional D1 metrics"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-authors = [{name = "SparseTrace"}]
+authors = [{name = "r2d1 contributors"}]
 dependencies = [
-    "boto3>=1.28",
-    "requests>=2.31",
-    "python-dotenv>=1.0",
-    "numpy>=1.23",
-]
-keywords = ["machine-learning", "experiment-tracking", "cloudflare", "r2", "d1", "checkpoint"]
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3 :: Only",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+  "boto3>=1.28",
+  "requests>=2.28",
+  "numpy>=1.23",
+  "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
-checkpoint = ["numpy>=1.23"]
-torch = ["numpy>=1.23"]
-jax = ["numpy>=1.23"]
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["r2d1*"]
+torch = ["torch"]
+jax = ["jax", "jaxlib"]
+dev = ["build", "twine"]
