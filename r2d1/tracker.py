@@ -204,7 +204,7 @@ class Job:
                     manifest_files[item.filename]["content_type"] = item.content_type
 
             manifest = {
-                "r2d1_version": "0.1.0",
+                "r2d1_version": "0.1.5",
                 "job_id": self.job_id,
                 "epoch": int(epoch),
                 "slot": slot,
@@ -487,29 +487,23 @@ class Tracker:
         self._init_tables()
 
     @classmethod
-    def from_env(cls) -> "Tracker":
-        """Construct from R2D1_* environment variables."""
-        required = {
-            "account_id": "R2D1_ACCOUNT_ID",
-            "api_token": "R2D1_API_TOKEN",
-            "d1_database_id": "R2D1_D1_DATABASE_ID",
-            "r2_bucket": "R2D1_R2_BUCKET",
-            "r2_access_key": "R2D1_R2_ACCESS_KEY",
-            "r2_secret_key": "R2D1_R2_SECRET_KEY",
-        }
-        values = {}
-        missing = []
-        for arg, env in required.items():
-            val = os.environ.get(env)
-            if not val:
-                missing.append(env)
-            else:
-                values[arg] = val
-        if missing:
-            raise EnvironmentError("Missing environment variables: " + ", ".join(missing))
-        endpoint = os.environ.get("R2D1_R2_ENDPOINT_URL")
-        if endpoint:
-            values["r2_endpoint_url"] = endpoint
+    def from_env(
+        cls,
+        *,
+        dotenv_path: Optional[str | os.PathLike[str]] = None,
+        set_env: bool = True,
+    ) -> "Tracker":
+        """Construct from R2D1 credentials found in env/.env/notebook secrets.
+
+        Search order is handled by :func:`r2d1.credentials.r2d1_config`:
+        .env, os.environ, Google Colab secrets, then Kaggle
+        secrets. Modal, Vast.ai, RunPod, Docker, CI, SageMaker, Vertex,
+        Lightning AI, and similar GPU/cloud platforms are covered when they
+        inject secrets into os.environ.
+        """
+        from .credentials import r2d1_config
+
+        values = r2d1_config(required=True, dotenv_path=dotenv_path, set_env=set_env)
         return cls(**values)  # type: ignore[arg-type]
 
     def _d1(self, sql: str, params: Optional[Iterable[Any]] = None) -> Dict[str, Any]:

@@ -9,15 +9,29 @@ Public API:
         epoch.d1(loss=0.1)              # metrics / metadata -> D1
         epoch.r2({"ckpt.bin": path})   # artifacts / checkpoints -> R2
 """
-
 from .tracker import Tracker, Job
 from .loop import r2d1, Epoch
+from .credentials import (
+    secret,
+    require_secret,
+    lookup_secret,
+    export_secrets,
+    r2d1_config,
+    load_dotenv,
+    MissingSecretError,
+)
 
-__version__ = "0.1.4"
-
+__version__ = "0.1.5"
 __all__ = [
     "Tracker",
     "Job",
     "r2d1",
     "Epoch",
+    "secret",
+    "require_secret",
+    "lookup_secret",
+    "export_secrets",
+    "r2d1_config",
+    "load_dotenv",
+    "MissingSecretError",
 ]
