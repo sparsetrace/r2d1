@@ -9,7 +9,7 @@ description = "Tiny ML experiment tracking on Cloudflare R2 + D1"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-authors = [{name = "r2d1 authors"}]
+authors = [{name = "SparseTrace"}]
 dependencies = [
     "boto3>=1.28",
     "requests>=2.31",
