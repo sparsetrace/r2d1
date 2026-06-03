@@ -1,23 +1,29 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.build_meta"
+requires      = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
-name = "r2d1"
-version = "0.1.6"
-description = "Lightweight ML checkpoint courier — Cloudflare R2 storage + optional D1 metrics"
-readme = "README.md"
-requires-python = ">=3.9"
-license = {text = "MIT"}
-authors = [{name = "r2d1 contributors"}]
+name        = "r2d1"
+version     = "0.1.0"
+description = "Lightweight ML checkpoint courier — Cloudflare R2 storage, D1 metadata"
+readme      = "README.md"
+license     = { text = "MIT" }
+requires-python = ">=3.10"
+
 dependencies = [
-  "boto3>=1.28",
-  "requests>=2.28",
-  "numpy>=1.23",
-  "python-dotenv>=1.0",
+    "boto3>=1.26",
+    "requests>=2.28",
 ]
 
 [project.optional-dependencies]
-torch = ["torch"]
-jax = ["jax", "jaxlib"]
-dev = ["build", "twine"]
+dotenv = ["python-dotenv>=1.0"]
+dev    = ["pytest", "pytest-mock", "moto[s3]>=5.0"]
+
+[project.scripts]
+r2d1 = "r2d1.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/yourname/r2d1"
+
+[tool.hatch.build.targets.wheel]
+packages = ["r2d1"]
