@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name        = "r2d1"
-version     = "0.2.0"
+version     = "0.2.1"
 description = "ML checkpoint courier — Cloudflare R2 storage and D1 metadata"
 readme      = "README.md"
 license     = { text = "MIT" }
