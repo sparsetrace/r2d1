@@ -2,13 +2,16 @@
 r2d1.courier — Watch a local directory and ship new checkpoints to R2 + D1.
 
 The sidecar convention:
-    <watch_dir>/chk_0042/        checkpoint folder  → uploaded to R2
-    <watch_dir>/chk_0042.json    JSON sidecar       → triggers ship, upserted to D1
+    <watch_dir>/slot_0/        checkpoint folder  → uploaded to R2
+    <watch_dir>/slot_0.json    JSON sidecar       → triggers ship, upserted to D1
 
-Courier polls for new .json sidecars. When one appears:
+Courier polls for new or updated .json sidecars. When one appears:
   1. Enqueue every file in the matching folder for upload to R2 (async).
   2. Upsert a metadata row to D1 (heartbeat).
-  3. Record the sidecar name as shipped to avoid re-shipping.
+  3. Record (name, epoch) as shipped to avoid re-shipping the same version.
+
+Keying on (name, epoch) means slot_0.json can be re-shipped each time DDIT
+overwrites it with a new epoch — R2 always has the latest version of each slot.
 
 Works with any checkpoint format — torch .pt, safetensors, HF save_pretrained(),
 or anything else. r2d1 never inspects file contents.
@@ -67,12 +70,16 @@ class Courier:
     """
     Ship checkpoints to R2 + D1 as they appear on disk.
 
+    Supports slot-based rotation (slot_0, slot_1, ...) — each slot is
+    re-shipped every time DDIT overwrites it with a new epoch. R2 always
+    holds the latest version of each slot.
+
     Typical bob.py usage:
 
         courier = Courier.from_config(cfg["secrets"])
         courier.watch("/root/checkpoints", job_id=job_id)
-        # ... DDIT trains, writes chk_N/ + chk_N.json ...
-        courier.flush(timeout=300)   # wait for final upload before exit
+        # ... DDIT trains, writes slot_N/ + slot_N.json ...
+        courier.flush(timeout=300)
     """
 
     def __init__(
@@ -81,8 +88,10 @@ class Courier:
         bucket:    str,
         d1_client: Optional[D1Client] = None,
     ):
-        self._uploader  = _AsyncUploader(r2_client, bucket)
-        self._d1        = d1_client
+        self._uploader = _AsyncUploader(r2_client, bucket)
+        self._d1       = d1_client
+        # keyed on "slot_0.json:42" — (filename:epoch) so same slot at a
+        # new epoch is treated as a new event and re-shipped
         self._shipped:  set[str] = set()
         self._d1_warned = False
 
@@ -90,20 +99,15 @@ class Courier:
 
     @classmethod
     def from_config(cls, secrets: dict) -> "Courier":
-        """
-        Build from the 'secrets' block of bob_job.json.
-        Exports secrets to os.environ as a side-effect.
-        """
+        """Build from the 'secrets' block of bob_job.json."""
         import os
         for key, val in secrets.items():
             if val and key != "_comment":
                 os.environ.setdefault(key, str(val))
-
         cfg     = r2d1_config()
         missing = missing_r2(cfg)
         if missing:
             raise config_error("R2", missing)
-
         r2 = r2_client_from_cfg(cfg)
         d1 = D1Client.from_env_optional()
         return cls(r2_client=r2, bucket=cfg["r2_bucket"], d1_client=d1)
@@ -129,7 +133,7 @@ class Courier:
         blocking:   bool = False,
     ) -> None:
         """
-        Start watching watch_dir for new chk_*.json sidecars.
+        Start watching watch_dir for new or updated sidecars.
 
         blocking=False (default): starts a daemon thread and returns immediately.
         blocking=True:  blocks forever — use this in subprocess/CLI mode.
@@ -158,9 +162,12 @@ class Courier:
     def _scan(self, watch_dir: Path, job_id: str) -> None:
         if not watch_dir.exists():
             return
-        for sidecar in sorted(watch_dir.glob("chk_*.json")):
-            if sidecar.name not in self._shipped:
-                self._process(sidecar, job_id)
+        # match both chk_*.json and slot_*.json
+        for sidecar in sorted(watch_dir.glob("*.json")):
+            if not (sidecar.stem.startswith("chk_") or
+                    sidecar.stem.startswith("slot_")):
+                continue
+            self._process(sidecar, job_id)
 
     def _process(self, sidecar: Path, job_id: str) -> None:
         try:
@@ -169,21 +176,28 @@ class Courier:
             print(f"[r2d1] cannot read {sidecar.name}: {exc}")
             return
 
-        name    = meta.get("name", sidecar.stem)
-        chk_dir = sidecar.with_suffix("")   # chk_0042.json → chk_0042/
+        name  = meta.get("name", sidecar.stem)
+        epoch = meta.get("epoch", 0)
+
+        # Key on (filename, epoch) so the same slot at a new epoch re-ships
+        ship_key = f"{sidecar.name}:{epoch}"
+        if ship_key in self._shipped:
+            return
+
+        chk_dir = sidecar.with_suffix("")   # slot_0.json → slot_0/
 
         if not chk_dir.is_dir():
             print(f"[r2d1] folder {chk_dir.name}/ not found — skipping")
             return
 
-        r2_prefix = f"jobs/{job_id}/{name}"
+        r2_prefix = f"jobs/{job_id}/checkpoints/{name}"
 
         # Enqueue all checkpoint files
         for f in sorted(chk_dir.iterdir()):
             if f.is_file():
                 self._uploader.submit(f, f"{r2_prefix}/{f.name}")
 
-        # Also ship the sidecar itself so Fetcher can read it during R2 scan
+        # Also ship the sidecar itself
         self._uploader.submit(sidecar, f"{r2_prefix}/{sidecar.name}")
 
         # D1 heartbeat row
@@ -192,12 +206,12 @@ class Courier:
                 self._d1.upsert("checkpoints", {
                     "job_id":    job_id,
                     "name":      name,
-                    "epoch":     meta.get("epoch", -1),
+                    "epoch":     epoch,
                     "timestamp": meta.get("timestamp", time.time()),
                     "r2_prefix": r2_prefix,
                     "metadata":  json.dumps(meta.get("metadata", {})),
                 })
-                print(f"[r2d1] D1 heartbeat → {name}")
+                print(f"[r2d1] D1 heartbeat → {name} epoch {epoch}")
             except Exception as exc:
                 print(f"[r2d1] D1 upsert failed for {name}: {exc}")
         else:
@@ -205,5 +219,5 @@ class Courier:
                 print("[r2d1] D1 not configured — R2-only mode")
                 self._d1_warned = True
 
-        self._shipped.add(sidecar.name)
-        print(f"[r2d1] {name} queued for upload")
+        self._shipped.add(ship_key)
+        print(f"[r2d1] {name} epoch {epoch} queued for upload → {r2_prefix}")
