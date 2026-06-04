@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name        = "r2d1"
-version     = "0.1.0"
-description = "Lightweight ML checkpoint courier — Cloudflare R2 storage, D1 metadata"
+version     = "0.2.0"
+description = "ML checkpoint courier — Cloudflare R2 storage and D1 metadata"
 readme      = "README.md"
 license     = { text = "MIT" }
 requires-python = ">=3.10"
@@ -17,7 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dotenv = ["python-dotenv>=1.0"]
-dev    = ["pytest", "pytest-mock", "moto[s3]>=5.0"]
+dev    = ["pytest>=7", "pytest-mock", "moto[s3]>=5.0"]
 
 [project.scripts]
 r2d1 = "r2d1.__main__:main"
@@ -26,4 +26,7 @@ r2d1 = "r2d1.__main__:main"
 Repository = "https://github.com/yourname/r2d1"
 
 [tool.hatch.build.targets.wheel]
-packages = ["r2d1"]
+packages = ["src/r2d1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

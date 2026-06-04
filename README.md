@@ -1,28 +1,56 @@
 # r2d1
 
 Lightweight ML checkpoint courier. Ships checkpoint folders to Cloudflare **R2**
-and records metadata to Cloudflare **D1**. Model-agnostic — works with any
-training code that follows the sidecar convention.
+and records metadata to Cloudflare **D1**. Pulls existing checkpoints back down
+before a run. Model-agnostic — works with any training code that writes files
+to a local directory.
 
 ```bash
 pip install r2d1
 ```
 
-## Core idea
+---
 
-Any training code writes two things per checkpoint:
+## How it fits into bob.py
+
+```
+bob_job.json (secrets + config)
+       │
+       ▼
+   bob.py
+     │
+     ├─ Fetcher.from_config(secrets)
+     │    └─ pull("r2://jobs/<id>/latest", dest)   ← checkpoint on disk (or fresh start)
+     │
+     ├─ Courier.from_config(secrets)
+     │    └─ watch(checkpoint_dir, job_id)          ← ships new checkpoints in background
+     │
+     ├─ subprocess: torchrun DDIT                   ← trains, writes chk_N/ + chk_N.json
+     │
+     └─ courier.flush()                             ← wait for final upload, then exit
+```
+
+DDIT (and any training code) sees only local disk. It has no knowledge of R2,
+D1, or any cloud infrastructure.
+
+---
+
+## Sidecar convention
+
+Training code writes two things per checkpoint, **folder first, sidecar last**:
 
 ```
 ./checkpoints/
-|-- chk_0042/          # checkpoint folder  → shipped to R2
-`-- chk_0042.json      # JSON sidecar       → sent to D1, triggers ship
+├── chk_0042/            ← checkpoint folder  → uploaded to R2
+│   ├── checkpoint.pt
+│   └── config.json
+└── chk_0042.json        ← sidecar (written last) → triggers upload, upserted to D1
 ```
 
-The sidecar is written **last** (after all folder contents are flushed),
-providing an atomic multi-file readiness signal. `r2d1` polls for new
-`.json` sidecars; when one appears the folder is guaranteed complete.
+The sidecar is the atomic signal. Writing it last guarantees the folder is
+complete before r2d1 touches it.
 
-## Sidecar schema
+### Sidecar schema
 
 ```json
 {
@@ -34,86 +62,100 @@ providing an atomic multi-file readiness signal. `r2d1` polls for new
 }
 ```
 
-## Courier — ship checkpoints as they appear
+Any checkpoint format works — `checkpoint.pt`, `model.safetensors`,
+HuggingFace `save_pretrained()` output, etc. r2d1 ships whatever is in the folder.
+
+---
+
+## Fetcher — pull checkpoints from R2
+
+```python
+from r2d1 import Fetcher
+
+# Build from bob_job.json secrets block (also exports to os.environ)
+fetcher = Fetcher.from_config(cfg["secrets"])
+
+# Pull latest checkpoint for a job — returns found=False on fresh start, never raises
+info = fetcher.pull("r2://jobs/my_run/latest", dest="/root/checkpoints")
+
+if info.found:
+    print(f"resuming from epoch {info.epoch} at {info.local_dir}")
+else:
+    print("no checkpoint — fresh start")
+
+# Pull a specific checkpoint by name
+fetcher.pull("r2://jobs/my_run/chk_0042", dest="/root/checkpoints")
+
+# Pull any R2 prefix (e.g. a dataset stored in R2)
+fetcher.pull("r2://datasets/mnist", dest="/root/data")
+```
+
+### URI schemes
+
+| URI | What it does |
+|-----|-------------|
+| `r2://jobs/<id>/latest` | Find highest-epoch checkpoint (D1 → R2 fallback), download it |
+| `r2://jobs/<id>/<name>` | Download a specific named checkpoint folder |
+| `r2://<any/prefix>` | Download all objects under that R2 prefix |
+
+`found=False` is returned (not raised) when no checkpoint exists — this is
+the normal fresh-start case. Check `info.found` before loading weights.
+
+---
+
+## Courier — ship checkpoints to R2 + D1
 
 ```python
 from r2d1 import Courier
 
-courier = Courier.from_env()
+courier = Courier.from_config(cfg["secrets"])
 
-# Option A: background thread (in-process)
-courier.watch("./checkpoints", job_id="my_run")
-# ... training writes chk_N/ + chk_N.json ...
-courier.flush(timeout=300)   # wait for final upload before exit
+# Start background thread — returns immediately
+courier.watch("/root/checkpoints", job_id="my_run")
 
-# Option B: subprocess (fully decoupled from training process)
-# python -m r2d1 watch ./checkpoints --job-id my_run --poll-every 30
+# ... training runs here, writes chk_N/ + chk_N.json as it goes ...
+
+# Wait for all uploads to finish before exiting
+courier.flush(timeout=300)
 ```
 
-## Restarter — resume from latest checkpoint
+Or as a fully decoupled subprocess:
 
-```python
-from r2d1 import Restarter
-
-info = Restarter.from_env().pull(
-    job_id = "my_run",
-    dest   = "/workspace/checkpoints",
-)
-
-if info.found:
-    # info.local_dir  -- Path to downloaded checkpoint folder
-    # info.epoch      -- epoch number of the checkpoint
-    model.load_state_dict(torch.load(info.local_dir / "checkpoint.pt"))
-    start_epoch = info.epoch + 1
-else:
-    start_epoch = 0
+```bash
+python -m r2d1 watch /root/checkpoints --job-id my_run
 ```
 
-Restarter queries D1 first (fast). Falls back to scanning R2 if D1 is
-unavailable.
-
-## Orchestration via bob.py
-
-In a typical deployment a separate `bob.py` sequences things explicitly:
-
-1. `Restarter.pull()` — **blocks** until checkpoint is downloaded locally
-2. Model program starts — sees only local files, zero cloud knowledge
-3. `Courier.watch()` — runs in background, ships new checkpoints as they appear
-
-This keeps the model completely decoupled from cloud infrastructure.
+---
 
 ## Credentials
 
-`r2d1` searches in order (does not override existing env vars):
+Credentials come from the `secrets` block of `bob_job.json`. `from_config()`
+exports them to `os.environ` so boto3 and requests pick them up automatically.
 
-1. `.env` in current directory or parents
-2. `os.environ` — covers Modal, Vast.ai, RunPod, Docker, CI, SageMaker, etc.
-3. Google Colab `userdata`
-4. Kaggle `UserSecretsClient`
+For local dev, put them in a `.env` file (requires `pip install r2d1[dotenv]`)
+or set them directly in your shell.
 
 ### Required for R2
 
-```bash
-export R2D1_ACCOUNT_ID="..."
-export R2D1_R2_BUCKET="..."
-export R2D1_R2_ACCESS_KEY="..."
-export R2D1_R2_SECRET_KEY="..."
-# optional:
-export R2D1_R2_ENDPOINT_URL="https://<account_id>.r2.cloudflarestorage.com"
 ```
-
-Aliases: `CLOUDFLARE_ACCOUNT_ID`, `R2_BUCKET`, `AWS_ACCESS_KEY_ID`, etc.
-`R2D1_*` names take priority.
+R2D1_ACCOUNT_ID
+R2D1_R2_BUCKET
+R2D1_R2_ACCESS_KEY
+R2D1_R2_SECRET_KEY
+R2D1_R2_ENDPOINT_URL   (optional — auto-constructed from ACCOUNT_ID if omitted)
+```
 
 ### Optional for D1
 
-```bash
-export R2D1_API_TOKEN="..."
-export R2D1_D1_DATABASE_ID="..."
+```
+R2D1_API_TOKEN
+R2D1_D1_DATABASE_ID
 ```
 
-If D1 credentials are absent, `r2d1` runs in R2-only mode — checkpoints are
-still shipped, no metadata rows are written, a warning is printed once.
+If D1 credentials are absent, r2d1 runs in R2-only mode — checkpoints are
+still shipped and pulled, no metadata rows are written.
+
+---
 
 ## D1 schema
 
@@ -122,35 +164,51 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     job_id    TEXT    NOT NULL,
     name      TEXT    NOT NULL,
     epoch     INTEGER NOT NULL,
-    timestamp REAL    NOT NULL,
+    timestamp REAL    NOT NULL,   -- doubles as heartbeat
     r2_prefix TEXT    NOT NULL,
     metadata  TEXT    DEFAULT '{}',
     PRIMARY KEY (job_id, name)
 );
 ```
 
-The table doubles as a **heartbeat** — check `timestamp` of the latest row
-to determine whether a job is still making progress.
+Alice (or any orchestrator) can check job progress with:
+
+```sql
+SELECT epoch, timestamp FROM checkpoints
+WHERE job_id = ? ORDER BY epoch DESC LIMIT 1;
+```
+
+---
 
 ## CLI
 
 ```bash
-# Watch and ship
-python -m r2d1 watch ./checkpoints --job-id my_run
+# Ship checkpoints as they appear
+python -m r2d1 watch ./checkpoints --job-id my_run [--poll-every 30]
 
-# Pull latest checkpoint
-python -m r2d1 pull --job-id my_run --dest ./checkpoints
+# Pull from R2
+python -m r2d1 pull r2://jobs/my_run/latest --dest ./checkpoints
+python -m r2d1 pull r2://datasets/mnist      --dest ./data
 
 # Show discovered credentials
 python -m r2d1 secrets
 ```
 
-## Secret utility
+---
 
-```python
-from r2d1 import secret, export_secrets, discover_common_secrets
+## Repo structure
 
-hf_token = secret("HF_TOKEN", required=False)
-export_secrets(["HF_TOKEN", "GITHUB_TOKEN", "WANDB_API_KEY"], required=False)
-discover_common_secrets()   # exports all common ML tokens opportunistically
+```
+r2d1/
+├── src/
+│   └── r2d1/
+│       ├── __init__.py      # exports: Courier, Fetcher, FetchInfo
+│       ├── __main__.py      # CLI
+│       ├── courier.py       # Courier + _AsyncUploader
+│       ├── fetcher.py       # Fetcher + FetchInfo
+│       ├── d1.py            # D1Client (REST)
+│       └── secrets.py       # credential resolution
+├── tests/
+│   └── test_r2d1.py
+└── pyproject.toml
 ```
