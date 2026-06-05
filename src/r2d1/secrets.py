@@ -73,17 +73,16 @@ def config_error(component: str, missing: list[str]) -> RuntimeError:
 
 
 def r2_client_from_cfg(cfg: dict):
-    """Build and return a boto3 S3 client pointed at Cloudflare R2."""
     import boto3
-    endpoint = cfg["r2_endpoint_url"] or (
+    endpoint = cfg.get("r2_endpoint_url") or (
         f"https://{cfg['account_id']}.r2.cloudflarestorage.com"
     )
-    if cfg.get("session_token"):                        # ← add this
-        kwargs["aws_session_token"] = cfg["session_token"]
-    return boto3.client(
-        "s3",
+    kwargs = dict(                              # ← was missing
         endpoint_url          = endpoint,
         aws_access_key_id     = cfg["r2_access_key"],
         aws_secret_access_key = cfg["r2_secret_key"],
         region_name           = "auto",
     )
+    if cfg.get("session_token"):
+        kwargs["aws_session_token"] = cfg["session_token"]
+    return boto3.client("s3", **kwargs)
