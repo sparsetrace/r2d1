@@ -26,6 +26,7 @@ _ALIASES: dict[str, list[str]] = {
     "r2_endpoint_url":["R2D1_R2_ENDPOINT_URL"],
     "api_token":      ["R2D1_API_TOKEN",       "CLOUDFLARE_API_TOKEN"],
     "d1_database_id": ["R2D1_D1_DATABASE_ID",  "D1_DATABASE_ID"],
+    "session_token":  ["R2D1_SESSION_TOKEN"],
 }
 
 
@@ -77,6 +78,8 @@ def r2_client_from_cfg(cfg: dict):
     endpoint = cfg["r2_endpoint_url"] or (
         f"https://{cfg['account_id']}.r2.cloudflarestorage.com"
     )
+    if cfg.get("session_token"):                        # ← add this
+        kwargs["aws_session_token"] = cfg["session_token"]
     return boto3.client(
         "s3",
         endpoint_url          = endpoint,
