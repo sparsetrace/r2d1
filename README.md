@@ -1,9 +1,10 @@
 # r2d1
 
-Lightweight ML checkpoint courier. Ships checkpoint folders to Cloudflare **R2**
-and records metadata to Cloudflare **D1**. Pulls existing checkpoints back down
-before a run. Model-agnostic — works with any training code that writes files
-to a local directory.
+Lightweight ML checkpoint courier for Cloudflare R2 and D1.
+
+Ships checkpoint folders from local disk to R2 storage. Pulls them back
+down before a run. Records metadata to D1 as a heartbeat. Model-agnostic —
+works with any training code that writes files to a local directory.
 
 ```bash
 pip install r2d1
@@ -11,50 +12,44 @@ pip install r2d1
 
 ---
 
-## How it fits into bob.py
+## Core idea
+
+Training code writes to local disk. r2d1 moves data in both directions
+without the training code knowing anything about cloud infrastructure:
 
 ```
-bob_job.json (secrets + config)
-       │
-       ▼
-   bob.py
-     │
-     ├─ Fetcher.from_config(secrets)
-     │    └─ pull("r2://jobs/<id>/latest", dest)   ← checkpoint on disk (or fresh start)
-     │
-     ├─ Courier.from_config(secrets)
-     │    └─ watch(checkpoint_dir, job_id)          ← ships new checkpoints in background
-     │
-     ├─ subprocess: torchrun DDIT                   ← trains, writes chk_N/ + chk_N.json
-     │
-     └─ courier.flush()                             ← wait for final upload, then exit
+[Fetcher]  R2  →  local disk   pull before training
+[Courier]  local disk  →  R2   push during training (background)
 ```
 
-DDIT (and any training code) sees only local disk. It has no knowledge of R2,
-D1, or any cloud infrastructure.
+An external orchestrator sequences these steps explicitly. Training code
+starts only after Fetcher completes, and sees only local filesystem paths.
 
 ---
 
 ## Sidecar convention
 
-Training code writes two things per checkpoint, **folder first, sidecar last**:
+r2d1 watches a directory for pairs of a folder and a JSON sidecar.
+The sidecar is written **last**, after all folder contents are flushed —
+this makes it an atomic signal that the checkpoint is complete:
 
 ```
 ./checkpoints/
-├── chk_0042/            ← checkpoint folder  → uploaded to R2
+├── slot_0/              ← checkpoint folder  → uploaded to R2
 │   ├── checkpoint.pt
 │   └── config.json
-└── chk_0042.json        ← sidecar (written last) → triggers upload, upserted to D1
+└── slot_0.json          ← sidecar (written last) → triggers upload
 ```
 
-The sidecar is the atomic signal. Writing it last guarantees the folder is
-complete before r2d1 touches it.
+r2d1 never inspects file contents. Any checkpoint format works —
+`checkpoint.pt`, `model.safetensors`, HuggingFace `save_pretrained()`
+output, or anything else. Whatever is in the folder gets shipped.
 
 ### Sidecar schema
 
 ```json
 {
-    "name":      "chk_0042",
+    "name":      "slot_0",
     "epoch":     42,
     "timestamp": 1748123456.7,
     "files":     ["checkpoint.pt", "config.json"],
@@ -62,20 +57,20 @@ complete before r2d1 touches it.
 }
 ```
 
-Any checkpoint format works — `checkpoint.pt`, `model.safetensors`,
-HuggingFace `save_pretrained()` output, etc. r2d1 ships whatever is in the folder.
-
 ---
 
-## Fetcher — pull checkpoints from R2
+## Fetcher — pull data and checkpoints from R2
 
 ```python
 from r2d1 import Fetcher
 
-# Build from bob_job.json secrets block (also exports to os.environ)
-fetcher = Fetcher.from_config(cfg["secrets"])
+fetcher = Fetcher.from_env()
 
-# Pull latest checkpoint for a job — returns found=False on fresh start, never raises
+# Pull a dataset or any R2 prefix to local disk
+fetcher.pull("r2://datasets/mnist", dest="/root/data")
+
+# Pull latest checkpoint for a job
+# Returns found=False on fresh start — never raises
 info = fetcher.pull("r2://jobs/my_run/latest", dest="/root/checkpoints")
 
 if info.found:
@@ -83,11 +78,8 @@ if info.found:
 else:
     print("no checkpoint — fresh start")
 
-# Pull a specific checkpoint by name
-fetcher.pull("r2://jobs/my_run/chk_0042", dest="/root/checkpoints")
-
-# Pull any R2 prefix (e.g. a dataset stored in R2)
-fetcher.pull("r2://datasets/mnist", dest="/root/data")
+# Pull a specific prefix
+fetcher.pull("r2://jobs/my_run/slot_0", dest="/root/checkpoints/slot_0")
 ```
 
 ### URI schemes
@@ -95,11 +87,10 @@ fetcher.pull("r2://datasets/mnist", dest="/root/data")
 | URI | What it does |
 |-----|-------------|
 | `r2://jobs/<id>/latest` | Find highest-epoch checkpoint (D1 → R2 fallback), download it |
-| `r2://jobs/<id>/<name>` | Download a specific named checkpoint folder |
-| `r2://<any/prefix>` | Download all objects under that R2 prefix |
+| `r2://<any/prefix>` | Download all objects under that R2 prefix to local disk |
 
-`found=False` is returned (not raised) when no checkpoint exists — this is
-the normal fresh-start case. Check `info.found` before loading weights.
+`found=False` is returned when no checkpoint exists — the normal
+fresh-start case. Check `info.found` before loading weights.
 
 ---
 
@@ -108,12 +99,12 @@ the normal fresh-start case. Check `info.found` before loading weights.
 ```python
 from r2d1 import Courier
 
-courier = Courier.from_config(cfg["secrets"])
+courier = Courier.from_env()
 
 # Start background thread — returns immediately
-courier.watch("/root/checkpoints", job_id="my_run")
+courier.watch("./checkpoints", job_id="my_run")
 
-# ... training runs here, writes chk_N/ + chk_N.json as it goes ...
+# ... training runs here, writes slot_N/ + slot_N.json ...
 
 # Wait for all uploads to finish before exiting
 courier.flush(timeout=300)
@@ -122,18 +113,19 @@ courier.flush(timeout=300)
 Or as a fully decoupled subprocess:
 
 ```bash
-python -m r2d1 watch /root/checkpoints --job-id my_run
+python -m r2d1 watch ./checkpoints --job-id my_run
 ```
+
+The courier keys on `(sidecar_name, epoch)` — so a slot that gets
+overwritten with a new epoch is treated as a new event and re-shipped.
+R2 always holds the latest version of each slot.
 
 ---
 
 ## Credentials
 
-Credentials come from the `secrets` block of `bob_job.json`. `from_config()`
-exports them to `os.environ` so boto3 and requests pick them up automatically.
-
-For local dev, put them in a `.env` file (requires `pip install r2d1[dotenv]`)
-or set them directly in your shell.
+r2d1 reads credentials from `os.environ`. Set them before importing r2d1,
+or use a `.env` file (requires `pip install r2d1[dotenv]`).
 
 ### Required for R2
 
@@ -142,7 +134,8 @@ R2D1_ACCOUNT_ID
 R2D1_R2_BUCKET
 R2D1_R2_ACCESS_KEY
 R2D1_R2_SECRET_KEY
-R2D1_R2_ENDPOINT_URL   (optional — auto-constructed from ACCOUNT_ID if omitted)
+R2D1_R2_ENDPOINT_URL    optional — auto-constructed from ACCOUNT_ID if omitted
+R2D1_SESSION_TOKEN      optional — set when using scoped temporary credentials
 ```
 
 ### Optional for D1
@@ -153,7 +146,14 @@ R2D1_D1_DATABASE_ID
 ```
 
 If D1 credentials are absent, r2d1 runs in R2-only mode — checkpoints are
-still shipped and pulled, no metadata rows are written.
+still shipped and pulled, no metadata rows are written, a warning is
+printed once.
+
+### Temporary / scoped credentials
+
+r2d1 supports AWS-compatible session tokens for short-lived scoped
+credentials. Set `R2D1_SESSION_TOKEN` alongside the access and secret keys.
+boto3 will include it automatically on every request.
 
 ---
 
@@ -164,19 +164,15 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     job_id    TEXT    NOT NULL,
     name      TEXT    NOT NULL,
     epoch     INTEGER NOT NULL,
-    timestamp REAL    NOT NULL,   -- doubles as heartbeat
+    timestamp REAL    NOT NULL,
     r2_prefix TEXT    NOT NULL,
     metadata  TEXT    DEFAULT '{}',
     PRIMARY KEY (job_id, name)
 );
 ```
 
-Alice (or any orchestrator) can check job progress with:
-
-```sql
-SELECT epoch, timestamp FROM checkpoints
-WHERE job_id = ? ORDER BY epoch DESC LIMIT 1;
-```
+The `timestamp` column doubles as a heartbeat — query it to determine
+whether a job is still making progress.
 
 ---
 
@@ -202,12 +198,12 @@ python -m r2d1 secrets
 r2d1/
 ├── src/
 │   └── r2d1/
-│       ├── __init__.py      # exports: Courier, Fetcher, FetchInfo
-│       ├── __main__.py      # CLI
-│       ├── courier.py       # Courier + _AsyncUploader
-│       ├── fetcher.py       # Fetcher + FetchInfo
-│       ├── d1.py            # D1Client (REST)
-│       └── secrets.py       # credential resolution
+│       ├── __init__.py      exports: Courier, Fetcher, FetchInfo
+│       ├── __main__.py      CLI
+│       ├── courier.py       Courier + _AsyncUploader
+│       ├── fetcher.py       Fetcher + FetchInfo
+│       ├── d1.py            D1Client (REST)
+│       └── secrets.py       credential resolution + boto3 client factory
 ├── tests/
 │   └── test_r2d1.py
 └── pyproject.toml
